@@ -8,7 +8,6 @@ name = "echo"
 
 [dependencies]
 anyhow = "1.0.82"
-async-global-executor = "2.4.1"
 async-io = "2.3.2"
 bytes = "1.6.0"
 crossbeam-channel = "0.5.12"
@@ -22,8 +21,8 @@ smoltcp = "0.11.0"
 tracing = "0.1.40"
 
 [dev-dependencies]
+async-global-executor = "2.4.1"
 async-net = "2.0.0"
-netlink-packet-route = "0.18"
 netlink-sys = { version = "0.8", features = ["smol_socket"] }
 rtnetlink = { version = "0.14", default-features = false, features = ["smol_socket"] }
 tracing-subscriber = "0.3"
