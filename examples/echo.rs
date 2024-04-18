@@ -28,7 +28,7 @@ fn main() {
 
         info!("create tun done");
 
-        let (mut tcp_stack, mut tcp_listener) = TcpStack::new(fd, IP, GATEWAY, Some(MTU)).unwrap();
+        let (mut tcp_stack, mut tcp_acceptor) = TcpStack::new(fd, IP, GATEWAY, Some(MTU)).unwrap();
 
         info!("create tcp stack done");
 
@@ -37,7 +37,7 @@ fn main() {
         let connect_task =
             async_global_executor::spawn(async { TcpStream::connect("192.168.200.20:80").await });
 
-        let mut accept_tcp = tcp_listener.try_next().await.unwrap().unwrap();
+        let mut accept_tcp = tcp_acceptor.try_next().await.unwrap().unwrap();
         let mut connect_tcp = connect_task.await.unwrap();
 
         info!("connect and accept done");
@@ -53,6 +53,10 @@ fn main() {
 
         connect_tcp.read_exact(&mut buf).await.unwrap();
         assert_eq!(buf.as_slice(), b"test");
+
+        // equal shutdown write
+        accept_tcp.close().await.unwrap();
+        assert_eq!(connect_tcp.read(&mut [0; 1]).await.unwrap(), 0);
     });
 }
 

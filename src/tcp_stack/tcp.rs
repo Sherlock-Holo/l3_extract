@@ -12,10 +12,11 @@ use futures_channel::mpsc::UnboundedReceiver;
 use futures_util::task::AtomicWaker;
 use futures_util::{AsyncBufRead, AsyncRead, AsyncWrite, Stream, StreamExt};
 use smoltcp::iface::SocketHandle;
+use tracing::error;
 
 use crate::notify_channel::NotifySender;
 use crate::tcp_stack::wake_event::{
-    CloseEvent, ReadPoll, ReadWakeEvent, WakeEvent, WritePoll, WriteWakeEvent,
+    ReadPoll, ReadWakeEvent, ShutdownEvent, WakeEvent, WritePoll, WriteWakeEvent,
 };
 use crate::tcp_stack::TypedSocketHandle;
 use crate::wake_fn::wake_fn;
@@ -124,6 +125,8 @@ impl TcpStream {
                     }))
                     .is_err()
                 {
+                    error!("TcpStack may be dropped, send wake event failed");
+
                     return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)));
                 }
 
@@ -136,7 +139,9 @@ impl TcpStream {
                 let read_poll = match rx.try_recv() {
                     Err(TryRecvError::Empty) => return Poll::Pending,
                     Err(TryRecvError::Disconnected) => {
-                        return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)))
+                        error!("TcpStack may be dropped, try receive wake event response failed");
+
+                        return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)));
                     }
                     Ok(read_poll) => read_poll,
                 };
@@ -162,6 +167,13 @@ impl TcpStream {
                 }
             }
         }
+    }
+
+    fn is_close_write(&self) -> bool {
+        matches!(
+            self.close_state,
+            CloseState::Closed | CloseState::Closing(_)
+        )
     }
 }
 
@@ -211,10 +223,7 @@ impl AsyncWrite for TcpStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if matches!(
-            self.close_state,
-            CloseState::Closed | CloseState::Closing(_)
-        ) {
+        if self.is_close_write() {
             return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)));
         }
 
@@ -255,6 +264,10 @@ impl AsyncWrite for TcpStream {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.is_close_write() {
+            return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)));
+        }
+
         match &self.write_state {
             WriteState::Flushing(rx) => {
                 self.write_waker.register(cx.waker());
@@ -262,7 +275,9 @@ impl AsyncWrite for TcpStream {
                 let write_poll = match rx.try_recv() {
                     Err(TryRecvError::Empty) => return Poll::Pending,
                     Err(TryRecvError::Disconnected) => {
-                        return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)))
+                        error!("TcpStack may be dropped, try receive wake event response failed");
+
+                        return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)));
                     }
                     Ok(write_poll) => write_poll,
                 };
@@ -314,6 +329,8 @@ impl AsyncWrite for TcpStream {
                     }))
                     .is_err()
                 {
+                    error!("TcpStack may be dropped, send wake event failed");
+
                     return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)));
                 }
 
@@ -329,13 +346,15 @@ impl AsyncWrite for TcpStream {
                 self.close_waker.register(cx.waker());
                 if self
                     .wake_event_tx
-                    .send(WakeEvent::Close(CloseEvent {
+                    .send(WakeEvent::Shutdown(ShutdownEvent {
                         handle: TypedSocketHandle::Tcp(self.handle),
                         waker: create_share_waker(self.close_waker.clone()),
                         respond: tx,
                     }))
                     .is_err()
                 {
+                    error!("TcpStack may be dropped, send wake event failed");
+
                     return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)));
                 }
 
@@ -350,6 +369,8 @@ impl AsyncWrite for TcpStream {
                 match rx.try_recv() {
                     Err(TryRecvError::Empty) => Poll::Pending,
                     Err(TryRecvError::Disconnected) => {
+                        error!("TcpStack may be dropped, try receive wake event response failed");
+
                         Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)))
                     }
 
@@ -381,12 +402,12 @@ fn create_share_waker(atomic_waker: Arc<AtomicWaker>) -> Waker {
 }
 
 #[derive(Debug)]
-pub struct TcpListener {
+pub struct TcpAcceptor {
     pub(crate) tcp_stream_rx: UnboundedReceiver<io::Result<(SocketHandle, SocketAddr, SocketAddr)>>,
     pub(crate) wake_event_tx: NotifySender<WakeEvent>,
 }
 
-impl Stream for TcpListener {
+impl Stream for TcpAcceptor {
     type Item = io::Result<TcpStream>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {

@@ -14,7 +14,7 @@ use futures_channel::mpsc::UnboundedSender;
 use futures_util::{AsyncReadExt, AsyncWriteExt, FutureExt};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{DeviceCapabilities, Medium};
-use smoltcp::socket::tcp::{RecvError, Socket as TcpSocket, SocketBuffer, State};
+use smoltcp::socket::tcp::{RecvError, Socket as TcpSocket, SocketBuffer};
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
@@ -23,12 +23,11 @@ use smoltcp::wire::{
 };
 use tracing::{debug, error, instrument};
 
-use self::tcp::TcpListener;
-use self::wake_event::{ReadPoll, ReadyEvent, WakeEvent};
-use crate::notify_channel;
-use crate::notify_channel::{NotifyReceiver, NotifySender};
+use self::tcp::TcpAcceptor;
+use self::wake_event::{ReadPoll, ReadyEvent, WakeEvent, WritePoll};
+use crate::notify_channel::{self, NotifyReceiver, NotifySender};
 use crate::tap_fd::TapFd;
-use crate::tcp_stack::wake_event::WritePoll;
+use crate::tcp_stack::wake_event::ShutdownEvent;
 use crate::virtual_interface::VirtualInterface;
 use crate::wake_fn::wake_fn;
 
@@ -82,7 +81,7 @@ impl TcpStack {
         ipv4: Ipv4Cidr,
         ipv4_gateway: Ipv4Addr,
         mtu: Option<usize>,
-    ) -> anyhow::Result<(Self, TcpListener)> {
+    ) -> anyhow::Result<(Self, TcpAcceptor)> {
         let mtu = mtu.unwrap_or(MTU);
 
         let mut tap_capabilities = DeviceCapabilities::default();
@@ -99,7 +98,7 @@ impl TcpStack {
         let (tx, rx) = notify_channel::channel();
         let (tcp_stream_tx, tcp_stream_rx) = mpsc::unbounded();
 
-        let tcp_listener = TcpListener {
+        let tcp_listener = TcpAcceptor {
             tcp_stream_rx,
             wake_event_tx: tx.clone(),
         };
@@ -138,8 +137,6 @@ impl TcpStack {
 
     #[instrument(level = "debug", skip(self), err(Debug))]
     async fn drive_one(&mut self, sleep: Option<Duration>) -> anyhow::Result<Option<Duration>> {
-        debug!("start drive one");
-
         self.process_io(sleep).await?;
 
         debug!("process io done");
@@ -148,6 +145,8 @@ impl TcpStack {
 
         self.interface
             .poll(timestamp, &mut self.virtual_iface, &mut self.socket_set);
+
+        debug!("poll interface done");
 
         let events = match self.wake_events.collect_nonblock() {
             Err(err) => return Err(err).with_context(|| "broken wake socket queue"),
@@ -179,38 +178,8 @@ impl TcpStack {
                     self.handle_ready_wake_event(ready_event);
                 }
 
-                WakeEvent::Close(close_event) => {
-                    if self.socket_handles.contains(&close_event.handle) {
-                        match close_event.handle {
-                            TypedSocketHandle::Tcp(handle) => {
-                                let socket = self.socket_set.get_mut::<TcpSocket>(handle);
-                                if socket.state() == State::Closed {
-                                    self.socket_handles.remove(&close_event.handle);
-                                    let _ = close_event.respond.send(Poll::Ready(Ok(())));
-
-                                    continue;
-                                }
-
-                                socket.close();
-                                socket.register_send_waker(&close_event.waker);
-                                let _ = close_event.respond.send(Poll::Pending);
-                            }
-
-                            TypedSocketHandle::Udp { handle, .. } => {
-                                let socket = self.socket_set.get_mut::<UdpSocket>(handle);
-                                socket.close();
-                                self.socket_set.remove(handle);
-                                self.socket_handles.remove(&close_event.handle);
-                                let _ = close_event.respond.send(Poll::Ready(Ok(())));
-                            }
-                        }
-                    } else {
-                        error!(?close_event, "unknown close event");
-                        let _ = close_event.respond.send(Poll::Ready(Err(io::Error::new(
-                            ErrorKind::Other,
-                            "unknown close event",
-                        ))));
-                    }
+                WakeEvent::Shutdown(close_event) => {
+                    self.handle_shutdown_event(close_event);
                 }
             }
         }
@@ -236,6 +205,42 @@ impl TcpStack {
         Ok(sleep.map(Into::into))
     }
 
+    #[instrument(level = "debug", skip(self))]
+    fn handle_shutdown_event(&mut self, close_event: &ShutdownEvent) {
+        if self.socket_handles.contains(&close_event.handle) {
+            match close_event.handle {
+                TypedSocketHandle::Tcp(handle) => {
+                    let socket = self.socket_set.get_mut::<TcpSocket>(handle);
+                    let _ = close_event.respond.send(Poll::Ready(Ok(())));
+                    socket.register_send_waker(&close_event.waker);
+                    socket.close();
+
+                    debug!("shutdown tcp socket write done");
+                }
+
+                TypedSocketHandle::Udp { handle, peer } => {
+                    let socket = self.socket_set.get_mut::<UdpSocket>(handle);
+                    let _ = close_event.respond.send(Poll::Ready(Ok(())));
+                    socket.register_send_waker(&close_event.waker);
+                    socket.close();
+
+                    self.remove_udp_socket(handle, peer);
+
+                    debug!("shutdown udp socket write done");
+                }
+            }
+
+            return;
+        }
+
+        error!(?close_event, "unknown close event");
+        let _ = close_event.respond.send(Poll::Ready(Err(io::Error::new(
+            ErrorKind::Other,
+            "unknown close event",
+        ))));
+    }
+
+    #[instrument(level = "debug", skip(self))]
     fn handle_ready_wake_event(&mut self, ready_event: &ReadyEvent) {
         match ready_event.handle {
             TypedSocketHandle::Tcp(handle) => {
@@ -263,232 +268,242 @@ impl TcpStack {
     #[instrument(level = "debug", skip(self))]
     fn handle_tcp_wake_events(&mut self, events: Vec<WakeEvent>) {
         for event in events {
-            match event {
-                WakeEvent::Write(mut event) => {
-                    if !self.socket_handles.contains(&event.handle) {
-                        error!(?event, "tcp socket not found");
+            self.handle_tcp_wake_event(event);
+        }
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    fn handle_tcp_wake_event(&mut self, event: WakeEvent) {
+        match event {
+            WakeEvent::Write(mut event) => {
+                if !self.socket_handles.contains(&event.handle) {
+                    error!(?event, "tcp socket not found");
+
+                    let _ = event.respond.send(WritePoll::Ready {
+                        buf: event.data,
+                        result: Err(io::Error::from(ErrorKind::NotFound)),
+                    });
+
+                    event.waker.wake();
+
+                    return;
+                }
+
+                let socket = self.socket_set.get_mut::<TcpSocket>(event.handle.into());
+                if !socket.can_send() {
+                    if !socket.may_send() {
+                        let _ = event.respond.send(WritePoll::Ready {
+                            buf: event.data,
+                            result: Err(io::Error::from(ErrorKind::BrokenPipe)),
+                        });
+
+                        event.waker.wake();
+                    } else {
+                        socket.register_send_waker(&event.waker);
+
+                        let _ = event.respond.send(WritePoll::Pending(event.data));
+                    }
+
+                    return;
+                }
+
+                match socket.send_slice(&event.data) {
+                    Err(err) => {
+                        error!(?err, ?event, "send data failed");
 
                         let _ = event.respond.send(WritePoll::Ready {
                             buf: event.data,
-                            result: Err(io::Error::from(ErrorKind::NotFound)),
+                            result: Err(io::Error::new(ErrorKind::Other, err)),
                         });
 
                         event.waker.wake();
-
-                        continue;
                     }
 
-                    let socket = self.socket_set.get_mut::<TcpSocket>(event.handle.into());
-                    if !socket.can_send() {
-                        if !socket.may_send() {
-                            let _ = event.respond.send(WritePoll::Ready {
-                                buf: event.data,
-                                result: Err(io::Error::from(ErrorKind::BrokenPipe)),
-                            });
+                    Ok(n) => {
+                        event.data.advance(n);
+                        let _ = event.respond.send(WritePoll::Ready {
+                            buf: event.data,
+                            result: Ok(()),
+                        });
 
-                            event.waker.wake();
-                        } else {
-                            socket.register_send_waker(&event.waker);
-
-                            let _ = event.respond.send(WritePoll::Pending(event.data));
-                        }
-
-                        continue;
-                    }
-
-                    match socket.send_slice(&event.data) {
-                        Err(err) => {
-                            error!(?err, ?event, "send data failed");
-
-                            let _ = event.respond.send(WritePoll::Ready {
-                                buf: event.data,
-                                result: Err(io::Error::new(ErrorKind::Other, err)),
-                            });
-
-                            event.waker.wake();
-                        }
-
-                        Ok(n) => {
-                            event.data.advance(n);
-                            let _ = event.respond.send(WritePoll::Ready {
-                                buf: event.data,
-                                result: Ok(()),
-                            });
-
-                            event.waker.wake();
-                        }
+                        event.waker.wake();
                     }
                 }
+            }
 
-                WakeEvent::Read(mut event) => {
-                    if !self.socket_handles.contains(&event.handle) {
-                        error!(?event, "tcp socket not found");
+            WakeEvent::Read(mut event) => {
+                if !self.socket_handles.contains(&event.handle) {
+                    error!(?event, "tcp socket not found");
 
-                        let _ = event.respond.send(ReadPoll::Ready {
-                            buf: event.buffer,
-                            result: Err(io::Error::from(ErrorKind::NotFound)),
-                        });
-
-                        event.waker.wake();
-
-                        continue;
-                    }
-
-                    let socket = self.socket_set.get_mut::<TcpSocket>(event.handle.into());
-                    if !socket.can_recv() {
-                        if !socket.may_recv() {
-                            let _ = event.respond.send(ReadPoll::Ready {
-                                buf: event.buffer,
-                                result: Err(io::Error::from(ErrorKind::BrokenPipe)),
-                            });
-
-                            event.waker.wake();
-                        } else {
-                            socket.register_recv_waker(&event.waker);
-
-                            let _ = event.respond.send(ReadPoll::Pending(event.buffer));
-                        }
-
-                        continue;
-                    }
-
-                    let res = socket.recv(|data| {
-                        event.buffer.extend_from_slice(data);
-
-                        (data.len(), ())
+                    let _ = event.respond.send(ReadPoll::Ready {
+                        buf: event.buffer,
+                        result: Err(io::Error::from(ErrorKind::NotFound)),
                     });
-                    match res {
-                        Err(RecvError::Finished) => {
-                            // when tcp read eof, still return the buffer
-                            let _ = event.respond.send(ReadPoll::Ready {
-                                buf: event.buffer,
-                                result: Ok(()),
-                            });
-                        }
-
-                        Err(err @ RecvError::InvalidState) => {
-                            let _ = event.respond.send(ReadPoll::Ready {
-                                buf: event.buffer,
-                                result: Err(io::Error::new(ErrorKind::Other, err)),
-                            });
-                        }
-
-                        Ok(_) => {
-                            let _ = event.respond.send(ReadPoll::Ready {
-                                buf: event.buffer,
-                                result: Ok(()),
-                            });
-                        }
-                    }
 
                     event.waker.wake();
+
+                    return;
                 }
 
-                WakeEvent::Ready(_) | WakeEvent::Close(_) => unreachable!(),
+                let socket = self.socket_set.get_mut::<TcpSocket>(event.handle.into());
+                if !socket.can_recv() {
+                    if !socket.may_recv() {
+                        let _ = event.respond.send(ReadPoll::Ready {
+                            buf: event.buffer,
+                            result: Err(io::Error::from(ErrorKind::BrokenPipe)),
+                        });
+
+                        event.waker.wake();
+                    } else {
+                        socket.register_recv_waker(&event.waker);
+
+                        let _ = event.respond.send(ReadPoll::Pending(event.buffer));
+                    }
+
+                    return;
+                }
+
+                let res = socket.recv(|data| {
+                    event.buffer.extend_from_slice(data);
+
+                    (data.len(), ())
+                });
+                match res {
+                    Err(RecvError::Finished) => {
+                        // when tcp read eof, still return the buffer
+                        let _ = event.respond.send(ReadPoll::Ready {
+                            buf: event.buffer,
+                            result: Ok(()),
+                        });
+                    }
+
+                    Err(err @ RecvError::InvalidState) => {
+                        let _ = event.respond.send(ReadPoll::Ready {
+                            buf: event.buffer,
+                            result: Err(io::Error::new(ErrorKind::Other, err)),
+                        });
+                    }
+
+                    Ok(_) => {
+                        let _ = event.respond.send(ReadPoll::Ready {
+                            buf: event.buffer,
+                            result: Ok(()),
+                        });
+                    }
+                }
+
+                event.waker.wake();
             }
+
+            WakeEvent::Ready(_) | WakeEvent::Shutdown(_) => unreachable!(),
         }
     }
 
     #[instrument(level = "debug", skip(self))]
     fn handle_udp_wake_events(&mut self, events: Vec<WakeEvent>) {
         for event in events {
-            match event {
-                WakeEvent::Write(mut event) => {
-                    if !self.socket_handles.contains(&event.handle) {
-                        error!(?event, "udp socket not found");
+            self.handle_udp_wake_event(event);
+        }
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    fn handle_udp_wake_event(&mut self, event: WakeEvent) {
+        match event {
+            WakeEvent::Write(mut event) => {
+                if !self.socket_handles.contains(&event.handle) {
+                    error!(?event, "udp socket not found");
+
+                    let _ = event.respond.send(WritePoll::Ready {
+                        buf: event.data,
+                        result: Err(io::Error::from(ErrorKind::NotFound)),
+                    });
+
+                    event.waker.wake();
+
+                    return;
+                }
+
+                let socket = self.socket_set.get_mut::<UdpSocket>(event.handle.into());
+                if !socket.can_send() {
+                    socket.register_send_waker(&event.waker);
+
+                    let _ = event.respond.send(WritePoll::Pending(event.data));
+
+                    return;
+                }
+
+                let peer = match event.handle {
+                    TypedSocketHandle::Udp { peer, .. } => peer,
+                    _ => unreachable!(),
+                };
+
+                match socket.send_slice(&event.data, peer) {
+                    Err(err) => {
+                        error!(?err, ?event, "send data failed");
 
                         let _ = event.respond.send(WritePoll::Ready {
                             buf: event.data,
-                            result: Err(io::Error::from(ErrorKind::NotFound)),
+                            result: Err(io::Error::new(ErrorKind::Other, err)),
                         });
-
-                        event.waker.wake();
-
-                        continue;
                     }
 
-                    let socket = self.socket_set.get_mut::<UdpSocket>(event.handle.into());
-                    if !socket.can_send() {
-                        socket.register_send_waker(&event.waker);
-
-                        let _ = event.respond.send(WritePoll::Pending(event.data));
-
-                        continue;
+                    Ok(_) => {
+                        event.data.clear();
+                        let _ = event.respond.send(WritePoll::Ready {
+                            buf: event.data,
+                            result: Ok(()),
+                        });
                     }
-
-                    let peer = match event.handle {
-                        TypedSocketHandle::Udp { peer, .. } => peer,
-                        _ => unreachable!(),
-                    };
-
-                    match socket.send_slice(&event.data, peer) {
-                        Err(err) => {
-                            error!(?err, ?event, "send data failed");
-
-                            let _ = event.respond.send(WritePoll::Ready {
-                                buf: event.data,
-                                result: Err(io::Error::new(ErrorKind::Other, err)),
-                            });
-                        }
-
-                        Ok(_) => {
-                            event.data.clear();
-                            let _ = event.respond.send(WritePoll::Ready {
-                                buf: event.data,
-                                result: Ok(()),
-                            });
-                        }
-                    }
-
-                    event.waker.wake();
                 }
 
-                WakeEvent::Read(mut event) => {
-                    if !self.socket_handles.contains(&event.handle) {
-                        error!(?event, "udp socket not found");
+                event.waker.wake();
+            }
+
+            WakeEvent::Read(mut event) => {
+                if !self.socket_handles.contains(&event.handle) {
+                    error!(?event, "udp socket not found");
+
+                    let _ = event.respond.send(ReadPoll::Ready {
+                        buf: event.buffer,
+                        result: Err(io::Error::from(ErrorKind::NotFound)),
+                    });
+
+                    event.waker.wake();
+
+                    return;
+                }
+
+                let socket = self.socket_set.get_mut::<UdpSocket>(event.handle.into());
+                if !socket.can_recv() {
+                    socket.register_recv_waker(&event.waker);
+
+                    let _ = event.respond.send(ReadPoll::Pending(event.buffer));
+
+                    return;
+                }
+
+                match socket.recv() {
+                    Err(err) => {
+                        let _ = event.respond.send(ReadPoll::Ready {
+                            buf: event.buffer,
+                            result: Err(io::Error::new(ErrorKind::Other, err)),
+                        });
+                    }
+
+                    Ok((data, _)) => {
+                        event.buffer.extend_from_slice(data);
 
                         let _ = event.respond.send(ReadPoll::Ready {
                             buf: event.buffer,
-                            result: Err(io::Error::from(ErrorKind::NotFound)),
+                            result: Ok(()),
                         });
-
-                        event.waker.wake();
-
-                        continue;
                     }
-
-                    let socket = self.socket_set.get_mut::<UdpSocket>(event.handle.into());
-                    if !socket.can_recv() {
-                        socket.register_recv_waker(&event.waker);
-
-                        let _ = event.respond.send(ReadPoll::Pending(event.buffer));
-
-                        continue;
-                    }
-
-                    match socket.recv() {
-                        Err(err) => {
-                            let _ = event.respond.send(ReadPoll::Ready {
-                                buf: event.buffer,
-                                result: Err(io::Error::new(ErrorKind::Other, err)),
-                            });
-                        }
-
-                        Ok((data, _)) => {
-                            event.buffer.extend_from_slice(data);
-
-                            let _ = event.respond.send(ReadPoll::Ready {
-                                buf: event.buffer,
-                                result: Ok(()),
-                            });
-                        }
-                    }
-
-                    event.waker.wake();
                 }
 
-                WakeEvent::Ready(_) | WakeEvent::Close(_) => unreachable!(),
+                event.waker.wake();
             }
+
+            WakeEvent::Ready(_) | WakeEvent::Shutdown(_) => unreachable!(),
         }
     }
 

@@ -49,7 +49,7 @@ pub struct ReadyEvent {
 }
 
 #[derive(Debug)]
-pub struct CloseEvent {
+pub struct ShutdownEvent {
     pub handle: TypedSocketHandle,
     pub waker: Waker,
     pub respond: Sender<Poll<io::Result<()>>>,
@@ -60,5 +60,5 @@ pub enum WakeEvent {
     Write(WriteWakeEvent),
     Read(ReadWakeEvent),
     Ready(ReadyEvent),
-    Close(CloseEvent),
+    Shutdown(ShutdownEvent),
 }
