@@ -16,7 +16,7 @@ use tracing::error;
 
 use crate::notify_channel::NotifySender;
 use crate::tcp_stack::wake_event::{
-    ReadPoll, ReadWakeEvent, ShutdownEvent, WakeEvent, WritePoll, WriteWakeEvent,
+    CloseEvent, ReadPoll, ReadWakeEvent, ShutdownEvent, WakeEvent, WritePoll, WriteWakeEvent,
 };
 use crate::tcp_stack::TypedSocketHandle;
 use crate::wake_fn::wake_fn;
@@ -392,6 +392,14 @@ impl AsyncWrite for TcpStream {
 
             CloseState::Closed => Poll::Ready(Ok(())),
         }
+    }
+}
+
+impl Drop for TcpStream {
+    fn drop(&mut self) {
+        let _ = self.wake_event_tx.send(WakeEvent::Close(CloseEvent {
+            handle: TypedSocketHandle::Tcp(self.handle),
+        }));
     }
 }
 

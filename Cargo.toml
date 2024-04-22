@@ -6,6 +6,9 @@ edition = "2021"
 [[example]]
 name = "echo"
 
+[[example]]
+name = "close"
+
 [dependencies]
 anyhow = "1.0.82"
 async-io = "2.3.2"

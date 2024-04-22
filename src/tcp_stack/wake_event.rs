@@ -56,9 +56,15 @@ pub struct ShutdownEvent {
 }
 
 #[derive(Debug)]
+pub struct CloseEvent {
+    pub handle: TypedSocketHandle,
+}
+
+#[derive(Debug)]
 pub enum WakeEvent {
     Write(WriteWakeEvent),
     Read(ReadWakeEvent),
     Ready(ReadyEvent),
     Shutdown(ShutdownEvent),
+    Close(CloseEvent),
 }

@@ -24,12 +24,11 @@ use smoltcp::wire::{
 use tracing::{debug, error, instrument};
 
 use self::tcp::TcpAcceptor;
-use self::wake_event::{ReadPoll, ReadyEvent, WakeEvent, WritePoll};
+use self::wake_event::{CloseEvent, ReadPoll, ReadyEvent, ShutdownEvent, WakeEvent, WritePoll};
 use crate::notify_channel::{self, NotifyReceiver, NotifySender};
 use crate::tap_fd::TapFd;
-use crate::tcp_stack::wake_event::ShutdownEvent;
 use crate::virtual_interface::VirtualInterface;
-use crate::wake_fn::wake_fn;
+use crate::wake_fn::{wake_fn, wake_once_fn};
 
 pub mod tcp;
 mod wake_event;
@@ -178,8 +177,12 @@ impl TcpStack {
                     self.handle_ready_wake_event(ready_event);
                 }
 
-                WakeEvent::Shutdown(close_event) => {
-                    self.handle_shutdown_event(close_event);
+                WakeEvent::Shutdown(shutdown_event) => {
+                    self.handle_shutdown_event(shutdown_event);
+                }
+
+                WakeEvent::Close(close_event) => {
+                    self.handle_close_event(close_event);
                 }
             }
         }
@@ -206,13 +209,13 @@ impl TcpStack {
     }
 
     #[instrument(level = "debug", skip(self))]
-    fn handle_shutdown_event(&mut self, close_event: &ShutdownEvent) {
-        if self.socket_handles.contains(&close_event.handle) {
-            match close_event.handle {
+    fn handle_shutdown_event(&mut self, shutdown_event: &ShutdownEvent) {
+        if self.socket_handles.contains(&shutdown_event.handle) {
+            match shutdown_event.handle {
                 TypedSocketHandle::Tcp(handle) => {
                     let socket = self.socket_set.get_mut::<TcpSocket>(handle);
-                    let _ = close_event.respond.send(Poll::Ready(Ok(())));
-                    socket.register_send_waker(&close_event.waker);
+                    let _ = shutdown_event.respond.send(Poll::Ready(Ok(())));
+                    socket.register_send_waker(&shutdown_event.waker);
                     socket.close();
 
                     debug!("shutdown tcp socket write done");
@@ -220,8 +223,8 @@ impl TcpStack {
 
                 TypedSocketHandle::Udp { handle, peer } => {
                     let socket = self.socket_set.get_mut::<UdpSocket>(handle);
-                    let _ = close_event.respond.send(Poll::Ready(Ok(())));
-                    socket.register_send_waker(&close_event.waker);
+                    let _ = shutdown_event.respond.send(Poll::Ready(Ok(())));
+                    socket.register_send_waker(&shutdown_event.waker);
                     socket.close();
 
                     self.remove_udp_socket(handle, peer);
@@ -233,11 +236,55 @@ impl TcpStack {
             return;
         }
 
-        error!(?close_event, "unknown close event");
-        let _ = close_event.respond.send(Poll::Ready(Err(io::Error::new(
+        error!(?shutdown_event, "unknown shutdown event");
+        let _ = shutdown_event.respond.send(Poll::Ready(Err(io::Error::new(
             ErrorKind::Other,
-            "unknown close event",
+            "unknown shutdown event",
         ))));
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    fn handle_close_event(&mut self, close_event: &CloseEvent) {
+        if self.socket_handles.contains(&close_event.handle) {
+            match close_event.handle {
+                TypedSocketHandle::Tcp(handle) => {
+                    let socket = self.socket_set.get_mut::<TcpSocket>(handle);
+
+                    socket.close();
+
+                    debug!("shutdown tcp socket write done");
+
+                    if !socket.is_active() {
+                        self.remove_tcp_socket(handle);
+
+                        debug!("remove tcp socket done");
+
+                        return;
+                    }
+
+                    let wake_events_tx = self.wake_events_tx.clone();
+                    let waker = wake_once_fn(move || {
+                        let _ = wake_events_tx.send(WakeEvent::Close(CloseEvent {
+                            handle: TypedSocketHandle::Tcp(handle),
+                        }));
+                    });
+                    socket.register_recv_waker(&waker);
+                }
+
+                TypedSocketHandle::Udp { handle, peer } => {
+                    let socket = self.socket_set.get_mut::<UdpSocket>(handle);
+                    socket.close();
+
+                    self.remove_udp_socket(handle, peer);
+
+                    debug!("close udp socket write done");
+                }
+            }
+
+            return;
+        }
+
+        error!(?close_event, "unknown close event");
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -395,7 +442,7 @@ impl TcpStack {
                 event.waker.wake();
             }
 
-            WakeEvent::Ready(_) | WakeEvent::Shutdown(_) => unreachable!(),
+            WakeEvent::Ready(_) | WakeEvent::Shutdown(_) | WakeEvent::Close(_) => unreachable!(),
         }
     }
 
@@ -503,7 +550,7 @@ impl TcpStack {
                 event.waker.wake();
             }
 
-            WakeEvent::Ready(_) | WakeEvent::Shutdown(_) => unreachable!(),
+            WakeEvent::Ready(_) | WakeEvent::Shutdown(_) | WakeEvent::Close(_) => unreachable!(),
         }
     }
 
