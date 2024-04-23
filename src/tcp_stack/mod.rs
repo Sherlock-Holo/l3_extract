@@ -81,11 +81,11 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
     ) -> anyhow::Result<(Self, TcpAcceptor)> {
         let mtu = mtu.unwrap_or(MTU);
 
-        let mut tap_capabilities = DeviceCapabilities::default();
-        tap_capabilities.max_transmission_unit = mtu;
-        tap_capabilities.medium = Medium::Ip;
+        let mut tun_capabilities = DeviceCapabilities::default();
+        tun_capabilities.max_transmission_unit = mtu;
+        tun_capabilities.medium = Medium::Ip;
 
-        let mut virtual_iface = VirtualInterface::new(tap_capabilities);
+        let mut virtual_iface = VirtualInterface::new(tun_capabilities);
 
         let mut iface_config = Config::new(HardwareAddress::Ip);
         iface_config.random_seed = rand::random();
@@ -644,7 +644,7 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
             self.tun_connection
                 .write(&packet)
                 .await
-                .with_context(|| "write packet to tap failed")?;
+                .with_context(|| "write packet to tun failed")?;
 
             self.virtual_iface.consume_send_packet();
         }
@@ -674,9 +674,7 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
             }
         };
         if n == 0 {
-            error!("tap is broken");
-
-            return Err(anyhow::anyhow!("tap is broken"));
+            return Err(anyhow::anyhow!("tun is broken"));
         }
 
         Ok(Some(n))
