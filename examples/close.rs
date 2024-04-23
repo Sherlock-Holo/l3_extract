@@ -1,10 +1,11 @@
 use std::io;
+use std::io::{Error, Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::pin::pin;
 use std::time::Duration;
 
-use async_io::Timer;
+use async_io::{Async, IoSafe, Timer};
 use async_net::TcpStream;
 use futures_util::{AsyncReadExt, AsyncWriteExt, TryStreamExt};
 use l3_extract::tcp_stack::TcpStack;
@@ -58,7 +59,7 @@ fn main() {
     });
 }
 
-async fn create_tun() -> OwnedFd {
+async fn create_tun() -> Async<SafeFd> {
     let mut tun_conf = tun::configure();
     tun_conf
         .name(IFACE)
@@ -75,7 +76,7 @@ async fn create_tun() -> OwnedFd {
     let _netlink_task = async_global_executor::spawn(conn);
     init_tun(handle, IFACE, IP, GATEWAY).await;
 
-    tun_fd
+    Async::new(SafeFd(tun_fd)).unwrap()
 }
 
 async fn init_tun(handle: Handle, iface_name: &str, ipv4: Ipv4Cidr, ipv4_gateway: Ipv4Addr) {
@@ -126,4 +127,32 @@ fn init_log() {
     let layered = Registry::default().with(layer).with(LevelFilter::DEBUG);
 
     subscriber::set_global_default(layered).unwrap();
+}
+
+#[derive(Debug)]
+#[repr(transparent)]
+struct SafeFd(OwnedFd);
+
+unsafe impl IoSafe for SafeFd {}
+
+impl AsFd for SafeFd {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+impl Read for SafeFd {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        rustix::io::read(&self.0, buf).map_err(Error::from)
+    }
+}
+
+impl Write for SafeFd {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        rustix::io::write(&self.0, buf).map_err(Error::from)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }

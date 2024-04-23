@@ -2,16 +2,15 @@ use std::collections::HashSet;
 use std::io;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::os::fd::OwnedFd;
 use std::task::Poll;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use async_io::{Async, Timer};
 use bytes::Buf;
 use futures_channel::mpsc;
 use futures_channel::mpsc::UnboundedSender;
-use futures_util::{AsyncReadExt, AsyncWriteExt, FutureExt};
+use futures_timer::Delay;
+use futures_util::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, FutureExt};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{DeviceCapabilities, Medium};
 use smoltcp::socket::tcp::{RecvError, Socket as TcpSocket, SocketBuffer};
@@ -26,7 +25,6 @@ use tracing::{debug, error, instrument};
 use self::tcp::TcpAcceptor;
 use self::wake_event::{CloseEvent, ReadPoll, ReadyEvent, ShutdownEvent, WakeEvent, WritePoll};
 use crate::notify_channel::{self, NotifyReceiver, NotifySender};
-use crate::tap_fd::TapFd;
 use crate::virtual_interface::VirtualInterface;
 use crate::wake_fn::{wake_fn, wake_once_fn};
 
@@ -54,12 +52,12 @@ impl From<TypedSocketHandle> for SocketHandle {
     }
 }
 
-pub struct TcpStack {
+pub struct TcpStack<C> {
     ipv4_addr: Ipv4Addr,
     ipv4_gateway: Ipv4Addr,
 
-    tap_iface: Async<TapFd>,
-    tap_read_buf: Vec<u8>,
+    tun_connection: C,
+    tun_read_buf: Vec<u8>,
 
     interface: Interface,
     virtual_iface: VirtualInterface,
@@ -73,10 +71,10 @@ pub struct TcpStack {
     tcp_stream_tx: UnboundedSender<io::Result<(SocketHandle, SocketAddr, SocketAddr)>>,
 }
 
-impl TcpStack {
-    #[instrument(level = "debug", err(Debug))]
+impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
+    #[instrument(level = "debug", skip(connection), err(Debug))]
     pub fn new(
-        fd: OwnedFd,
+        connection: C,
         ipv4: Ipv4Cidr,
         ipv4_gateway: Ipv4Addr,
         mtu: Option<usize>,
@@ -105,8 +103,8 @@ impl TcpStack {
         let this = Self {
             ipv4_addr: ipv4.address().into(),
             ipv4_gateway,
-            tap_iface: Async::new(TapFd::from(fd))?,
-            tap_read_buf: vec![0; mtu],
+            tun_connection: connection,
+            tun_read_buf: vec![0; mtu],
             interface,
             virtual_iface,
             socket_set: SocketSet::new(vec![]),
@@ -570,7 +568,7 @@ impl TcpStack {
     #[instrument(level = "debug", skip(self), err(Debug))]
     async fn process_io(&mut self, sleep: Option<Duration>) -> anyhow::Result<()> {
         if let Some(n) = self.process_read_io(sleep).await? {
-            let buf = &self.tap_read_buf[..n];
+            let buf = &self.tun_read_buf[..n];
             self.virtual_iface.push_receive_packet(buf);
 
             if let Some(packet_type) = parse_packet(buf) {
@@ -643,8 +641,7 @@ impl TcpStack {
     #[instrument(level = "debug", skip(self), err(Debug))]
     async fn process_write_io(&mut self) -> anyhow::Result<()> {
         while let Some(packet) = self.virtual_iface.peek_send_packet() {
-            let mut tap_iface = &self.tap_iface;
-            tap_iface
+            self.tun_connection
                 .write(&packet)
                 .await
                 .with_context(|| "write packet to tap failed")?;
@@ -658,8 +655,7 @@ impl TcpStack {
     #[instrument(level = "debug", skip(self), ret, err(Debug))]
     async fn process_read_io(&mut self, sleep: Option<Duration>) -> anyhow::Result<Option<usize>> {
         let events_wait = self.wake_events.wait();
-        let mut tap_iface = &self.tap_iface;
-        let read = tap_iface.read(&mut self.tap_read_buf);
+        let read = self.tun_connection.read(&mut self.tun_read_buf);
         let n = match sleep {
             None => {
                 futures_util::select! {
@@ -669,7 +665,7 @@ impl TcpStack {
             }
 
             Some(delay) => {
-                let mut timer = FutureExt::fuse(Timer::after(delay));
+                let mut timer = Delay::new(delay).fuse();
                 futures_util::select! {
                     _ = timer => return Ok(None),
                     _ = events_wait.fuse() => return Ok(None),
