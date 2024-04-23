@@ -1,3 +1,4 @@
+use std::fmt::{Debug, Formatter};
 use std::mem::ManuallyDrop;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,10 +42,17 @@ impl<F: FnOnce()> Wake for WakeOnceFn<F> {
     }
 }
 
-#[derive(Debug)]
 struct AtomicOption<T> {
     used: AtomicBool,
     value: ManuallyDrop<T>,
+}
+
+impl<T> Debug for AtomicOption<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AtomicOption")
+            .field("used", &self.used.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
 }
 
 impl<T> AtomicOption<T> {
@@ -62,12 +70,14 @@ impl<T> AtomicOption<T> {
     }
 }
 
+unsafe impl<T: Send> Sync for AtomicOption<T> {}
+
 impl<T> Drop for AtomicOption<T> {
     fn drop(&mut self) {
         if !self.used.load(Ordering::Acquire) {
             // safety: atomic bool make sure only drop when no one use
             unsafe {
-                ptr::drop_in_place(&mut *self.value);
+                ManuallyDrop::drop(&mut self.value);
             }
         }
     }
