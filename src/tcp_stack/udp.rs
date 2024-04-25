@@ -22,35 +22,35 @@ use super::wake_event::{
 use super::{create_share_waker, TypedSocketHandle, UdpInfo};
 use crate::notify_channel::NotifySender;
 
-enum ReadState {
+enum RecvState {
     Buffer(BytesMut),
     WaitResult(Receiver<ReadPoll>),
 }
 
-impl Debug for ReadState {
+impl Debug for RecvState {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            ReadState::Buffer(_) => f.debug_struct("ReadState::Buffer").finish_non_exhaustive(),
+            RecvState::Buffer(_) => f.debug_struct("RecvState::Buffer").finish_non_exhaustive(),
 
-            ReadState::WaitResult(receiver) => f
-                .debug_struct("ReadState::WaitResult")
+            RecvState::WaitResult(receiver) => f
+                .debug_struct("RecvState::WaitResult")
                 .field("receiver", receiver)
                 .finish(),
         }
     }
 }
 
-enum WriteState {
+enum SendState {
     Buffer(BytesMut),
-    Flushing(Receiver<WritePoll>),
+    Sending(Receiver<WritePoll>),
 }
 
-impl Debug for WriteState {
+impl Debug for SendState {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            WriteState::Buffer(_) => f.debug_struct("WriteState::Buffer").finish_non_exhaustive(),
-            WriteState::Flushing(rx) => f
-                .debug_struct("WriteState::Flushing")
+            SendState::Buffer(_) => f.debug_struct("SendState::Buffer").finish_non_exhaustive(),
+            SendState::Sending(rx) => f
+                .debug_struct("SendState::Sending")
                 .field("receiver", rx)
                 .finish(),
         }
@@ -65,10 +65,10 @@ pub struct UdpSocket {
     send_payload_capacity: usize,
     wake_event_tx: NotifySender<WakeEvent>,
 
-    read_state: Mutex<ReadState>,
+    read_state: Mutex<RecvState>,
     read_waker: Arc<AtomicWaker>,
 
-    write_state: Mutex<WriteState>,
+    write_state: Mutex<SendState>,
     write_waker: Arc<AtomicWaker>,
 }
 
@@ -91,11 +91,11 @@ impl UdpSocket {
         poll_fn(|cx| {
             loop {
                 match &*read_state {
-                    ReadState::Buffer(_) => {
+                    RecvState::Buffer(_) => {
                         let (tx, rx) = crossbeam_channel::bounded(1);
-                        let read_state = mem::replace(&mut *read_state, ReadState::WaitResult(rx));
+                        let read_state = mem::replace(&mut *read_state, RecvState::WaitResult(rx));
                         let buf = match read_state {
-                            ReadState::Buffer(buf) => buf,
+                            RecvState::Buffer(buf) => buf,
                             _ => unreachable!(),
                         };
 
@@ -118,7 +118,7 @@ impl UdpSocket {
                         return Poll::Pending;
                     }
 
-                    ReadState::WaitResult(rx) => {
+                    RecvState::WaitResult(rx) => {
                         self.read_waker.register(cx.waker());
 
                         let read_poll = match rx.try_recv() {
@@ -133,7 +133,7 @@ impl UdpSocket {
 
                         match read_poll {
                             ReadPoll::Pending(buf) => {
-                                *read_state = ReadState::Buffer(buf);
+                                *read_state = RecvState::Buffer(buf);
 
                                 // tcp stack wake but in earlier udp socket not ready, so we need to
                                 // poll again
@@ -147,13 +147,13 @@ impl UdpSocket {
                                         inner_buf.copy_to_slice(&mut buf[..n]);
                                         inner_buf.clear();
 
-                                        *read_state = ReadState::Buffer(inner_buf);
+                                        *read_state = RecvState::Buffer(inner_buf);
 
                                         Poll::Ready(Ok(n))
                                     }
 
                                     Err(err) => {
-                                        *read_state = ReadState::Buffer(inner_buf);
+                                        *read_state = RecvState::Buffer(inner_buf);
 
                                         Poll::Ready(Err(err))
                                     }
@@ -183,11 +183,11 @@ impl UdpSocket {
         poll_fn(|cx| {
             loop {
                 match &*write_state {
-                    WriteState::Buffer(_) => {
+                    SendState::Buffer(_) => {
                         let (tx, rx) = crossbeam_channel::bounded(1);
-                        let write_state = mem::replace(&mut *write_state, WriteState::Flushing(rx));
+                        let write_state = mem::replace(&mut *write_state, SendState::Sending(rx));
                         let mut buf = match write_state {
-                            WriteState::Buffer(buf) => buf,
+                            SendState::Buffer(buf) => buf,
                             _ => unreachable!(),
                         };
 
@@ -213,7 +213,7 @@ impl UdpSocket {
                         return Poll::Pending;
                     }
 
-                    WriteState::Flushing(rx) => {
+                    SendState::Sending(rx) => {
                         self.write_waker.register(cx.waker());
 
                         let write_poll = match rx.try_recv() {
@@ -228,7 +228,7 @@ impl UdpSocket {
 
                         match write_poll {
                             WritePoll::Pending(buf) => {
-                                *write_state = WriteState::Buffer(buf);
+                                *write_state = SendState::Buffer(buf);
 
                                 // tcp stack wake but in earlier udp socket not ready, so we need
                                 // to poll again
@@ -236,7 +236,7 @@ impl UdpSocket {
                             }
 
                             WritePoll::Ready { buf, result } => {
-                                *write_state = WriteState::Buffer(buf);
+                                *write_state = SendState::Buffer(buf);
 
                                 return Poll::Ready(result);
                             }
@@ -281,10 +281,10 @@ impl Stream for UdpAcceptor {
                 handle: udp_info.handle,
                 send_payload_capacity: udp_info.send_payload_capacity,
                 wake_event_tx: self.wake_event_tx.clone(),
-                read_state: Mutex::new(ReadState::Buffer(BytesMut::with_capacity(
+                read_state: Mutex::new(RecvState::Buffer(BytesMut::with_capacity(
                     udp_info.recv_payload_capacity,
                 ))),
-                write_state: Mutex::new(WriteState::Buffer(BytesMut::with_capacity(
+                write_state: Mutex::new(SendState::Buffer(BytesMut::with_capacity(
                     udp_info.send_payload_capacity,
                 ))),
                 read_waker: Default::default(),

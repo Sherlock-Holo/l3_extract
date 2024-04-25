@@ -515,12 +515,12 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                     return;
                 }
 
-                let peer = match event.handle {
-                    TypedSocketHandle::Udp { dst: peer, .. } => peer,
+                let src = match event.handle {
+                    TypedSocketHandle::Udp { src, .. } => src,
                     _ => unreachable!(),
                 };
 
-                match socket.send_slice(&event.data, peer) {
+                match socket.send_slice(&event.data, src) {
                     Err(err) => {
                         error!(?err, ?event, "send data failed");
 
@@ -664,14 +664,10 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
         let handle = self.socket_set.add(socket);
         let typed_handle = TypedSocketHandle::Udp { handle, src, dst };
         self.socket_handles.insert(typed_handle);
-        let tx = self.wake_events_tx.clone();
-        let socket = self.socket_set.get_mut::<TcpSocket>(handle);
 
-        socket.register_send_waker(&wake_fn(move || {
-            let _ = tx.send(WakeEvent::Ready(ReadyEvent {
-                handle: typed_handle,
-            }));
-        }));
+        self.wake_events_tx.send(WakeEvent::Ready(ReadyEvent {
+            handle: typed_handle,
+        }))?;
 
         Ok(())
     }
