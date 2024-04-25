@@ -3,7 +3,7 @@ use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{ready, Context, Poll, Waker};
+use std::task::{ready, Context, Poll};
 use std::{io, mem};
 
 use bytes::{Buf, BytesMut};
@@ -14,12 +14,11 @@ use futures_util::{AsyncBufRead, AsyncRead, AsyncWrite, Stream, StreamExt};
 use smoltcp::iface::SocketHandle;
 use tracing::error;
 
-use crate::notify_channel::NotifySender;
-use crate::tcp_stack::wake_event::{
+use super::wake_event::{
     CloseEvent, ReadPoll, ReadWakeEvent, ShutdownEvent, WakeEvent, WritePoll, WriteWakeEvent,
 };
-use crate::tcp_stack::TypedSocketHandle;
-use crate::wake_fn::wake_fn;
+use super::{create_share_waker, TcpInfo, TypedSocketHandle};
+use crate::notify_channel::NotifySender;
 
 const BUF_CAP: usize = 8 * 1024;
 
@@ -403,15 +402,9 @@ impl Drop for TcpStream {
     }
 }
 
-fn create_share_waker(atomic_waker: Arc<AtomicWaker>) -> Waker {
-    wake_fn(move || {
-        atomic_waker.wake();
-    })
-}
-
 #[derive(Debug)]
 pub struct TcpAcceptor {
-    pub(crate) tcp_stream_rx: UnboundedReceiver<io::Result<(SocketHandle, SocketAddr, SocketAddr)>>,
+    pub(crate) tcp_stream_rx: UnboundedReceiver<io::Result<TcpInfo>>,
     pub(crate) wake_event_tx: NotifySender<WakeEvent>,
 }
 
@@ -422,11 +415,11 @@ impl Stream for TcpAcceptor {
         let res = ready!(self.tcp_stream_rx.poll_next_unpin(cx)).transpose()?;
         match res {
             None => Poll::Ready(None),
-            Some((handle, local_addr, remote_addr)) => Poll::Ready(Some(Ok(TcpStream {
+            Some(tcp_info) => Poll::Ready(Some(Ok(TcpStream {
                 read_eof: false,
-                local_addr,
-                remote_addr,
-                handle,
+                local_addr: tcp_info.local_addr,
+                remote_addr: tcp_info.remote_addr,
+                handle: tcp_info.handle,
                 wake_event_tx: self.wake_event_tx.clone(),
                 read_state: ReadState::Buffer(BytesMut::with_capacity(BUF_CAP)),
                 write_state: WriteState::Buffer(BytesMut::with_capacity(BUF_CAP)),

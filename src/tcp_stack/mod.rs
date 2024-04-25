@@ -2,7 +2,8 @@ use std::collections::HashSet;
 use std::io;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::task::Poll;
+use std::sync::Arc;
+use std::task::{Poll, Waker};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -10,6 +11,7 @@ use bytes::Buf;
 use futures_channel::mpsc;
 use futures_channel::mpsc::UnboundedSender;
 use futures_timer::Delay;
+use futures_util::task::AtomicWaker;
 use futures_util::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, FutureExt};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{DeviceCapabilities, Medium};
@@ -23,12 +25,14 @@ use smoltcp::wire::{
 use tracing::{debug, error, instrument};
 
 use self::tcp::TcpAcceptor;
+use self::udp::UdpAcceptor;
 use self::wake_event::{CloseEvent, ReadPoll, ReadyEvent, ShutdownEvent, WakeEvent, WritePoll};
 use crate::notify_channel::{self, NotifyReceiver, NotifySender};
 use crate::virtual_interface::VirtualInterface;
 use crate::wake_fn::{wake_fn, wake_once_fn};
 
 pub mod tcp;
+pub mod udp;
 mod wake_event;
 
 const SOCKET_BUF_SIZE: usize = 16 * 1024;
@@ -39,7 +43,8 @@ pub(crate) enum TypedSocketHandle {
     Tcp(SocketHandle),
     Udp {
         handle: SocketHandle,
-        peer: SocketAddr,
+        src: SocketAddr,
+        dst: SocketAddr,
     },
 }
 
@@ -50,6 +55,22 @@ impl From<TypedSocketHandle> for SocketHandle {
             TypedSocketHandle::Udp { handle, .. } => handle,
         }
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct TcpInfo {
+    handle: SocketHandle,
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
+}
+
+#[derive(Debug)]
+pub(crate) struct UdpInfo {
+    handle: SocketHandle,
+    send_payload_capacity: usize,
+    recv_payload_capacity: usize,
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
 }
 
 pub struct TcpStack<C> {
@@ -68,7 +89,8 @@ pub struct TcpStack<C> {
     wake_events_tx: NotifySender<WakeEvent>,
     wake_events: NotifyReceiver<WakeEvent>,
 
-    tcp_stream_tx: UnboundedSender<io::Result<(SocketHandle, SocketAddr, SocketAddr)>>,
+    tcp_stream_tx: UnboundedSender<io::Result<TcpInfo>>,
+    udp_stream_tx: UnboundedSender<io::Result<UdpInfo>>,
 }
 
 impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
@@ -78,7 +100,7 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
         ipv4: Ipv4Cidr,
         ipv4_gateway: Ipv4Addr,
         mtu: Option<usize>,
-    ) -> anyhow::Result<(Self, TcpAcceptor)> {
+    ) -> anyhow::Result<(Self, TcpAcceptor, UdpAcceptor)> {
         let mtu = mtu.unwrap_or(MTU);
 
         let mut tun_capabilities = DeviceCapabilities::default();
@@ -94,9 +116,14 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
 
         let (tx, rx) = notify_channel::channel();
         let (tcp_stream_tx, tcp_stream_rx) = mpsc::unbounded();
+        let (udp_stream_tx, udp_stream_rx) = mpsc::unbounded();
 
-        let tcp_listener = TcpAcceptor {
+        let tcp_acceptor = TcpAcceptor {
             tcp_stream_rx,
+            wake_event_tx: tx.clone(),
+        };
+        let udp_acceptor = UdpAcceptor {
+            udp_stream_rx,
             wake_event_tx: tx.clone(),
         };
 
@@ -112,9 +139,10 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
             wake_events_tx: tx.clone(),
             wake_events: rx,
             tcp_stream_tx,
+            udp_stream_tx,
         };
 
-        Ok((this, tcp_listener))
+        Ok((this, tcp_acceptor, udp_acceptor))
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
@@ -219,13 +247,13 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                     debug!("shutdown tcp socket write done");
                 }
 
-                TypedSocketHandle::Udp { handle, peer } => {
+                TypedSocketHandle::Udp { handle, src, dst } => {
                     let socket = self.socket_set.get_mut::<UdpSocket>(handle);
                     let _ = shutdown_event.respond.send(Poll::Ready(Ok(())));
                     socket.register_send_waker(&shutdown_event.waker);
                     socket.close();
 
-                    self.remove_udp_socket(handle, peer);
+                    self.remove_udp_socket(handle, src, dst);
 
                     debug!("shutdown udp socket write done");
                 }
@@ -269,11 +297,11 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                     socket.register_recv_waker(&waker);
                 }
 
-                TypedSocketHandle::Udp { handle, peer } => {
+                TypedSocketHandle::Udp { handle, src, dst } => {
                     let socket = self.socket_set.get_mut::<UdpSocket>(handle);
                     socket.close();
 
-                    self.remove_udp_socket(handle, peer);
+                    self.remove_udp_socket(handle, src, dst);
 
                     debug!("close udp socket write done");
                 }
@@ -299,13 +327,23 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                     .unwrap_or_else(|| panic!("tcp socket {handle} doesn't have remote addr"));
                 let remote_addr = SocketAddr::new(remote_addr.addr.into(), remote_addr.port);
 
-                let _ = self
-                    .tcp_stream_tx
-                    .unbounded_send(Ok((handle, local_addr, remote_addr)));
+                let _ = self.tcp_stream_tx.unbounded_send(Ok(TcpInfo {
+                    handle,
+                    local_addr,
+                    remote_addr,
+                }));
             }
 
-            TypedSocketHandle::Udp { .. } => {
-                todo!()
+            TypedSocketHandle::Udp { handle, src, dst } => {
+                let socket = self.socket_set.get::<UdpSocket>(handle);
+
+                let _ = self.udp_stream_tx.unbounded_send(Ok(UdpInfo {
+                    handle,
+                    send_payload_capacity: socket.payload_send_capacity(),
+                    recv_payload_capacity: socket.payload_recv_capacity(),
+                    local_addr: src,
+                    remote_addr: dst,
+                }));
             }
         }
     }
@@ -478,7 +516,7 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                 }
 
                 let peer = match event.handle {
-                    TypedSocketHandle::Udp { peer, .. } => peer,
+                    TypedSocketHandle::Udp { dst: peer, .. } => peer,
                     _ => unreachable!(),
                 };
 
@@ -559,10 +597,10 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
     }
 
     #[instrument(level = "debug", skip(self))]
-    fn remove_udp_socket(&mut self, handle: SocketHandle, peer: SocketAddr) {
+    fn remove_udp_socket(&mut self, handle: SocketHandle, src: SocketAddr, dst: SocketAddr) {
         self.socket_set.remove(handle);
         self.socket_handles
-            .remove(&TypedSocketHandle::Udp { handle, peer });
+            .remove(&TypedSocketHandle::Udp { handle, src, dst });
     }
 
     #[instrument(level = "debug", skip(self), err(Debug))]
@@ -624,7 +662,7 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
         let mut socket = create_udp_socket(SOCKET_BUF_SIZE);
         socket.bind(dst).with_context(|| "udp socket bind failed")?;
         let handle = self.socket_set.add(socket);
-        let typed_handle = TypedSocketHandle::Udp { handle, peer: src };
+        let typed_handle = TypedSocketHandle::Udp { handle, src, dst };
         self.socket_handles.insert(typed_handle);
         let tx = self.wake_events_tx.clone();
         let socket = self.socket_set.get_mut::<TcpSocket>(handle);
@@ -813,4 +851,10 @@ fn init_interface(
         .add_default_ipv4_route(gateway.into())?;
 
     Ok(())
+}
+
+fn create_share_waker(atomic_waker: Arc<AtomicWaker>) -> Waker {
+    wake_fn(move || {
+        atomic_waker.wake();
+    })
 }
