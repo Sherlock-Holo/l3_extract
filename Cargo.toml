@@ -9,6 +9,9 @@ name = "echo"
 [[example]]
 name = "close"
 
+[[example]]
+name = "udp_echo"
+
 [dependencies]
 anyhow = "1.0.82"
 bytes = "1.6.0"
