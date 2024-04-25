@@ -30,7 +30,8 @@ fn main() {
 
         info!("create tun done");
 
-        let (mut tcp_stack, mut tcp_acceptor) = TcpStack::new(fd, IP, GATEWAY, Some(MTU)).unwrap();
+        let (mut tcp_stack, mut tcp_acceptor, _) =
+            TcpStack::new(fd, IP, GATEWAY, Some(MTU)).unwrap();
 
         info!("create tcp stack done");
 
