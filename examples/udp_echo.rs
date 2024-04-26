@@ -7,7 +7,7 @@ use std::pin::pin;
 use async_io::{Async, IoSafe};
 use async_net::UdpSocket;
 use futures_util::TryStreamExt;
-use l3_extract::tcp_stack::TcpStack;
+use l3_extract::tcp_stack::TcpStackBuilder;
 use netlink_sys::SmolSocket;
 use rtnetlink::Handle;
 use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
@@ -30,8 +30,12 @@ fn main() {
 
         info!("create tun done");
 
-        let (mut tcp_stack, _, mut udp_acceptor) =
-            TcpStack::new(fd, IP, GATEWAY, Some(MTU)).unwrap();
+        let (mut tcp_stack, _, mut udp_acceptor) = TcpStackBuilder::default()
+            .ipv4_addr(IP)
+            .ipv4_gateway(GATEWAY)
+            .mtu(MTU)
+            .build(fd)
+            .unwrap();
 
         info!("create tcp stack done");
 

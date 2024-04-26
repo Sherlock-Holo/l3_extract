@@ -19,8 +19,8 @@ use smoltcp::socket::tcp::{RecvError, Socket as TcpSocket, SocketBuffer};
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    HardwareAddress, IpCidr, IpProtocol, IpVersion, Ipv4Cidr, Ipv4Packet, Ipv6Packet, TcpPacket,
-    UdpPacket,
+    HardwareAddress, IpCidr, IpProtocol, IpVersion, Ipv4Cidr, Ipv4Packet, Ipv6Cidr, Ipv6Packet,
+    TcpPacket, UdpPacket,
 };
 use tracing::{debug, error, instrument};
 
@@ -73,9 +73,77 @@ pub(crate) struct UdpInfo {
     remote_addr: SocketAddr,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct TcpStackBuilder {
+    ipv4_addr: Option<Ipv4Cidr>,
+    ipv4_gateway: Option<Ipv4Addr>,
+
+    ipv6_addr: Option<Ipv6Cidr>,
+    ipv6_gateway: Option<Ipv6Addr>,
+
+    mtu: Option<usize>,
+}
+
+impl TcpStackBuilder {
+    pub fn ipv4_addr(&mut self, ipv4_addr: Ipv4Cidr) -> &mut Self {
+        self.ipv4_addr = Some(ipv4_addr);
+        self
+    }
+
+    pub fn ipv4_gateway(&mut self, ipv4_gateway: Ipv4Addr) -> &mut Self {
+        self.ipv4_gateway = Some(ipv4_gateway);
+        self
+    }
+
+    pub fn ipv6_addr(&mut self, ipv6_addr: Ipv6Cidr) -> &mut Self {
+        self.ipv6_addr = Some(ipv6_addr);
+        self
+    }
+
+    pub fn ipv6_gateway(&mut self, ipv6_gateway: Ipv6Addr) -> &mut Self {
+        self.ipv6_gateway = Some(ipv6_gateway);
+        self
+    }
+
+    pub fn mtu(&mut self, mtu: usize) -> &mut Self {
+        self.mtu = Some(mtu);
+        self
+    }
+
+    pub fn build<C>(
+        &self,
+        connection: C,
+    ) -> anyhow::Result<(TcpStack<C>, TcpAcceptor, UdpAcceptor)> {
+        let ipv4 = match (self.ipv4_addr, self.ipv4_gateway) {
+            (None, None) => None,
+            (Some(ipv4_addr), Some(ipv4_gateway)) => Some((ipv4_addr, ipv4_gateway)),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "ipv4 should set ipv4 addr and gateway together"
+                ))
+            }
+        };
+
+        let ipv6 = match (self.ipv6_addr, self.ipv6_gateway) {
+            (None, None) => None,
+            (Some(ipv6_addr), Some(ipv6_gateway)) => Some((ipv6_addr, ipv6_gateway)),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "ipv6 should set ipv6 addr and gateway together"
+                ))
+            }
+        };
+
+        TcpStack::new(connection, ipv4, ipv6, self.mtu)
+    }
+}
+
 pub struct TcpStack<C> {
-    ipv4_addr: Ipv4Addr,
-    ipv4_gateway: Ipv4Addr,
+    ipv4_addr: Option<Ipv4Addr>,
+    ipv4_gateway: Option<Ipv4Addr>,
+
+    ipv6_addr: Option<Ipv6Addr>,
+    ipv6_gateway: Option<Ipv6Addr>,
 
     tun_connection: C,
     tun_read_buf: Vec<u8>,
@@ -93,12 +161,11 @@ pub struct TcpStack<C> {
     udp_stream_tx: UnboundedSender<io::Result<UdpInfo>>,
 }
 
-impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
-    #[instrument(level = "debug", skip(connection), err(Debug))]
-    pub fn new(
+impl<C> TcpStack<C> {
+    fn new(
         connection: C,
-        ipv4: Ipv4Cidr,
-        ipv4_gateway: Ipv4Addr,
+        ipv4: Option<(Ipv4Cidr, Ipv4Addr)>,
+        ipv6: Option<(Ipv6Cidr, Ipv6Addr)>,
         mtu: Option<usize>,
     ) -> anyhow::Result<(Self, TcpAcceptor, UdpAcceptor)> {
         let mtu = mtu.unwrap_or(MTU);
@@ -112,7 +179,13 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
         let mut iface_config = Config::new(HardwareAddress::Ip);
         iface_config.random_seed = rand::random();
         let mut interface = Interface::new(iface_config, &mut virtual_iface, Instant::now());
-        init_interface(&mut interface, ipv4, ipv4_gateway)?;
+
+        if let Some((ipv4_addr, ipv4_gateway)) = ipv4 {
+            ipv4_init_interface(&mut interface, ipv4_addr, ipv4_gateway)?;
+        }
+        if let Some((ipv6_addr, ipv6_gateway)) = ipv6 {
+            ipv6_init_interface(&mut interface, ipv6_addr, ipv6_gateway)?;
+        }
 
         let (tx, rx) = notify_channel::channel();
         let (tcp_stream_tx, tcp_stream_rx) = mpsc::unbounded();
@@ -128,8 +201,10 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
         };
 
         let this = Self {
-            ipv4_addr: ipv4.address().into(),
-            ipv4_gateway,
+            ipv4_addr: ipv4.map(|(addr, _)| addr.address().into()),
+            ipv4_gateway: ipv4.map(|(_, gateway)| gateway),
+            ipv6_addr: ipv6.map(|(addr, _)| addr.address().into()),
+            ipv6_gateway: ipv6.map(|(_, gateway)| gateway),
             tun_connection: connection,
             tun_read_buf: vec![0; mtu],
             interface,
@@ -144,7 +219,9 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
 
         Ok((this, tcp_acceptor, udp_acceptor))
     }
+}
 
+impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let mut sleep = None;
         loop {
@@ -152,12 +229,20 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
         }
     }
 
-    pub fn iface_ipv4_addr(&self) -> Ipv4Addr {
+    pub fn iface_ipv4_addr(&self) -> Option<Ipv4Addr> {
         self.ipv4_addr
     }
 
-    pub fn iface_ipv4_gateway(&self) -> Ipv4Addr {
+    pub fn iface_ipv4_gateway(&self) -> Option<Ipv4Addr> {
         self.ipv4_gateway
+    }
+
+    pub fn iface_ipv6_addr(&self) -> Option<Ipv6Addr> {
+        self.ipv6_addr
+    }
+
+    pub fn iface_ipv6_gateway(&self) -> Option<Ipv6Addr> {
+        self.ipv6_gateway
     }
 
     #[instrument(level = "debug", skip(self), err(Debug))]
@@ -827,7 +912,7 @@ fn create_udp_socket(socket_buf_size: usize) -> UdpSocket<'static> {
 }
 
 #[instrument(level = "debug", skip(interface), err(Debug))]
-fn init_interface(
+fn ipv4_init_interface(
     interface: &mut Interface,
     ipv4: Ipv4Cidr,
     gateway: Ipv4Addr,
@@ -845,6 +930,29 @@ fn init_interface(
     interface
         .routes_mut()
         .add_default_ipv4_route(gateway.into())?;
+
+    Ok(())
+}
+
+#[instrument(level = "debug", skip(interface), err(Debug))]
+fn ipv6_init_interface(
+    interface: &mut Interface,
+    ipv6: Ipv6Cidr,
+    gateway: Ipv6Addr,
+) -> anyhow::Result<()> {
+    interface.set_any_ip(true);
+    interface.update_ip_addrs(|addrs| {
+        addrs.push(IpCidr::Ipv6(ipv6)).unwrap();
+        addrs
+            .push(IpCidr::Ipv6(Ipv6Cidr::new(
+                gateway.into(),
+                ipv6.prefix_len(),
+            )))
+            .unwrap();
+    });
+    interface
+        .routes_mut()
+        .add_default_ipv6_route(gateway.into())?;
 
     Ok(())
 }

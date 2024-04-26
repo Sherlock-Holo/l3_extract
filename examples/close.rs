@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_io::{Async, IoSafe, Timer};
 use async_net::TcpStream;
 use futures_util::{AsyncReadExt, AsyncWriteExt, TryStreamExt};
-use l3_extract::tcp_stack::TcpStack;
+use l3_extract::tcp_stack::TcpStackBuilder;
 use netlink_sys::SmolSocket;
 use rtnetlink::Handle;
 use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
@@ -31,8 +31,12 @@ fn main() {
 
         info!("create tun done");
 
-        let (mut tcp_stack, mut tcp_acceptor, _) =
-            TcpStack::new(fd, IP, GATEWAY, Some(MTU)).unwrap();
+        let (mut tcp_stack, mut tcp_acceptor, _) = TcpStackBuilder::default()
+            .ipv4_addr(IP)
+            .ipv4_gateway(GATEWAY)
+            .mtu(MTU)
+            .build(fd)
+            .unwrap();
 
         info!("create tcp stack done");
 
