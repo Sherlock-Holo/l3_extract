@@ -8,8 +8,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use bytes::Buf;
-use futures_channel::mpsc;
-use futures_channel::mpsc::UnboundedSender;
+use flume::Sender;
 use futures_timer::Delay;
 use futures_util::task::AtomicWaker;
 use futures_util::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, FutureExt};
@@ -157,8 +156,8 @@ pub struct TcpStack<C> {
     wake_events_tx: NotifySender<WakeEvent>,
     wake_events: NotifyReceiver<WakeEvent>,
 
-    tcp_stream_tx: UnboundedSender<io::Result<TcpInfo>>,
-    udp_stream_tx: UnboundedSender<io::Result<UdpInfo>>,
+    tcp_stream_tx: Sender<io::Result<TcpInfo>>,
+    udp_stream_tx: Sender<io::Result<UdpInfo>>,
 }
 
 impl<C> TcpStack<C> {
@@ -188,15 +187,15 @@ impl<C> TcpStack<C> {
         }
 
         let (tx, rx) = notify_channel::channel();
-        let (tcp_stream_tx, tcp_stream_rx) = mpsc::unbounded();
-        let (udp_stream_tx, udp_stream_rx) = mpsc::unbounded();
+        let (tcp_stream_tx, tcp_stream_rx) = flume::unbounded();
+        let (udp_stream_tx, udp_stream_rx) = flume::unbounded();
 
         let tcp_acceptor = TcpAcceptor {
-            tcp_stream_rx,
+            tcp_stream_rx: tcp_stream_rx.into_stream(),
             wake_event_tx: tx.clone(),
         };
         let udp_acceptor = UdpAcceptor {
-            udp_stream_rx,
+            udp_stream_rx: udp_stream_rx.into_stream(),
             wake_event_tx: tx.clone(),
         };
 
@@ -426,7 +425,7 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                     .unwrap_or_else(|| panic!("tcp socket {handle} doesn't have remote addr"));
                 let remote_addr = SocketAddr::new(remote_addr.addr.into(), remote_addr.port);
 
-                let _ = self.tcp_stream_tx.unbounded_send(Ok(TcpInfo {
+                let _ = self.tcp_stream_tx.send(Ok(TcpInfo {
                     handle,
                     local_addr,
                     remote_addr,
@@ -436,7 +435,7 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
             TypedSocketHandle::Udp { handle, src, dst } => {
                 let socket = self.socket_set.get::<UdpSocket>(handle);
 
-                let _ = self.udp_stream_tx.unbounded_send(Ok(UdpInfo {
+                let _ = self.udp_stream_tx.send(Ok(UdpInfo {
                     handle,
                     send_payload_capacity: socket.payload_send_capacity(),
                     recv_payload_capacity: socket.payload_recv_capacity(),

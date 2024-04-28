@@ -8,7 +8,7 @@ use std::{io, mem};
 
 use bytes::{Buf, BytesMut};
 use crossbeam_channel::{Receiver, TryRecvError};
-use futures_channel::mpsc::UnboundedReceiver;
+use flume::r#async::RecvStream;
 use futures_util::task::AtomicWaker;
 use futures_util::{AsyncBufRead, AsyncRead, AsyncWrite, Stream, StreamExt};
 use smoltcp::iface::SocketHandle;
@@ -423,10 +423,18 @@ impl Drop for TcpStream {
     }
 }
 
-#[derive(Debug)]
 pub struct TcpAcceptor {
-    pub(crate) tcp_stream_rx: UnboundedReceiver<io::Result<TcpInfo>>,
+    pub(crate) tcp_stream_rx: RecvStream<'static, io::Result<TcpInfo>>,
     pub(crate) wake_event_tx: NotifySender<WakeEvent>,
+}
+
+impl Debug for TcpAcceptor {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TcpAcceptor")
+            .field("tcp_stream_rx", &"{ ... }")
+            .field("wake_event_tx", &self.wake_event_tx)
+            .finish()
+    }
 }
 
 impl Stream for TcpAcceptor {

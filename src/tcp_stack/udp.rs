@@ -9,7 +9,7 @@ use std::{io, mem};
 
 use bytes::{Buf, BytesMut};
 use crossbeam_channel::{Receiver, TryRecvError};
-use futures_channel::mpsc::UnboundedReceiver;
+use flume::r#async::RecvStream;
 use futures_util::lock::Mutex;
 use futures_util::task::AtomicWaker;
 use futures_util::{Stream, StreamExt};
@@ -262,10 +262,18 @@ impl Drop for UdpSocket {
     }
 }
 
-#[derive(Debug)]
 pub struct UdpAcceptor {
-    pub(crate) udp_stream_rx: UnboundedReceiver<io::Result<UdpInfo>>,
+    pub(crate) udp_stream_rx: RecvStream<'static, io::Result<UdpInfo>>,
     pub(crate) wake_event_tx: NotifySender<WakeEvent>,
+}
+
+impl Debug for UdpAcceptor {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UdpAcceptor")
+            .field("udp_stream_rx", &"{ ... }")
+            .field("wake_event_tx", &self.wake_event_tx)
+            .finish()
+    }
 }
 
 impl Stream for UdpAcceptor {

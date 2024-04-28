@@ -18,7 +18,7 @@ bytes = "1.6.0"
 crossbeam-channel = "0.5.12"
 derivative = "2.2.0"
 event-listener = "5.3.0"
-futures-channel = "0.3.30"
+flume = { version = "0.11.0", default-features = false, features = ["async"] }
 futures-timer = "3.0.3"
 futures-util = { version = "0.3.30", features = ["io"] }
 rand = "0.8.5"
