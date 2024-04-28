@@ -140,7 +140,10 @@ impl TcpStream {
                     Err(TryRecvError::Disconnected) => {
                         error!("TcpStack may be dropped, try receive wake event response failed");
 
-                        return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)));
+                        return Poll::Ready(Err(io::Error::new(
+                            ErrorKind::BrokenPipe,
+                            "TcpStack may be dropped, try receive wake event response failed",
+                        )));
                     }
                     Ok(read_poll) => read_poll,
                 };
@@ -223,7 +226,10 @@ impl AsyncWrite for TcpStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         if self.is_close_write() {
-            return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)));
+            return Poll::Ready(Err(io::Error::new(
+                ErrorKind::BrokenPipe,
+                "TcpStream is closed",
+            )));
         }
 
         match &mut self.write_state {
@@ -264,7 +270,10 @@ impl AsyncWrite for TcpStream {
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.is_close_write() {
-            return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)));
+            return Poll::Ready(Err(io::Error::new(
+                ErrorKind::BrokenPipe,
+                "TcpStream is closed",
+            )));
         }
 
         match &self.write_state {
@@ -276,7 +285,10 @@ impl AsyncWrite for TcpStream {
                     Err(TryRecvError::Disconnected) => {
                         error!("TcpStack may be dropped, try receive wake event response failed");
 
-                        return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)));
+                        return Poll::Ready(Err(io::Error::new(
+                            ErrorKind::BrokenPipe,
+                            "TcpStack may be dropped, try receive wake event response failed",
+                        )));
                     }
                     Ok(write_poll) => write_poll,
                 };
@@ -330,7 +342,10 @@ impl AsyncWrite for TcpStream {
                 {
                     error!("TcpStack may be dropped, send wake event failed");
 
-                    return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)));
+                    return Poll::Ready(Err(io::Error::new(
+                        ErrorKind::BrokenPipe,
+                        "TcpStack may be dropped, send wake event failed",
+                    )));
                 }
 
                 Poll::Pending
@@ -354,7 +369,10 @@ impl AsyncWrite for TcpStream {
                 {
                     error!("TcpStack may be dropped, send wake event failed");
 
-                    return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)));
+                    return Poll::Ready(Err(io::Error::new(
+                        ErrorKind::BrokenPipe,
+                        "TcpStack may be dropped, send wake event failed",
+                    )));
                 }
 
                 self.close_state = CloseState::Closing(rx);
@@ -370,7 +388,10 @@ impl AsyncWrite for TcpStream {
                     Err(TryRecvError::Disconnected) => {
                         error!("TcpStack may be dropped, try receive wake event response failed");
 
-                        Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)))
+                        Poll::Ready(Err(io::Error::new(
+                            ErrorKind::BrokenPipe,
+                            "TcpStack may be dropped, try receive wake event response failed",
+                        )))
                     }
 
                     Ok(poll) => match poll {

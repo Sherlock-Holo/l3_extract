@@ -462,7 +462,10 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                     if !socket.may_send() {
                         let _ = event.respond.send(WritePoll::Ready {
                             buf: event.data,
-                            result: Err(io::Error::from(ErrorKind::BrokenPipe)),
+                            result: Err(io::Error::new(
+                                ErrorKind::BrokenPipe,
+                                format!("TCP send failed, socket state: {}", socket.state()),
+                            )),
                         });
 
                         event.waker.wake();
@@ -518,7 +521,10 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                     if !socket.may_recv() {
                         let _ = event.respond.send(ReadPoll::Ready {
                             buf: event.buffer,
-                            result: Err(io::Error::from(ErrorKind::BrokenPipe)),
+                            result: Err(io::Error::new(
+                                ErrorKind::BrokenPipe,
+                                format!("TCP recv failed, socket state: {}", socket.state()),
+                            )),
                         });
 
                         event.waker.wake();
@@ -919,7 +925,7 @@ fn ipv4_init_interface(
 ) -> anyhow::Result<()> {
     interface.set_any_ip(true);
     interface.update_ip_addrs(|addrs| {
-        addrs.push(IpCidr::Ipv4(ipv4)).unwrap();
+        // addrs.push(IpCidr::Ipv4(ipv4)).unwrap();
         addrs
             .push(IpCidr::Ipv4(Ipv4Cidr::new(
                 gateway.into(),
@@ -943,12 +949,12 @@ fn ipv6_init_interface(
     interface.set_any_ip(true);
     interface.update_ip_addrs(|addrs| {
         addrs.push(IpCidr::Ipv6(ipv6)).unwrap();
-        addrs
-            .push(IpCidr::Ipv6(Ipv6Cidr::new(
-                gateway.into(),
-                ipv6.prefix_len(),
-            )))
-            .unwrap();
+        /*addrs
+        .push(IpCidr::Ipv6(Ipv6Cidr::new(
+            gateway.into(),
+            ipv6.prefix_len(),
+        )))
+        .unwrap();*/
     });
     interface
         .routes_mut()
