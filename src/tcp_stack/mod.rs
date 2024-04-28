@@ -402,7 +402,21 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
     fn handle_ready_wake_event(&mut self, ready_event: &ReadyEvent) {
         match ready_event.handle {
             TypedSocketHandle::Tcp(handle) => {
-                let socket = self.socket_set.get::<TcpSocket>(handle);
+                let socket = self.socket_set.get_mut::<TcpSocket>(handle);
+
+                if !socket.may_recv() {
+                    debug!("tcp socket may send but may not recv, register recv waker and wait next waker up");
+
+                    let tx = self.wake_events_tx.clone();
+                    socket.register_recv_waker(&wake_fn(move || {
+                        let _ = tx.send(WakeEvent::Ready(ReadyEvent {
+                            handle: TypedSocketHandle::Tcp(handle),
+                        }));
+                    }));
+
+                    return;
+                }
+
                 let local_addr = socket
                     .local_endpoint()
                     .unwrap_or_else(|| panic!("tcp socket {handle} doesn't have local addr"));
