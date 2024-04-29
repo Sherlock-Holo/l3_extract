@@ -38,6 +38,7 @@ mod wake_event;
 
 const SOCKET_BUF_SIZE: usize = 16 * 1024;
 const MTU: usize = 1500;
+const TCP_BUF_CAP: usize = 8 * 1024;
 
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Hash)]
 pub(crate) enum TypedSocketHandle {
@@ -84,6 +85,7 @@ pub struct TcpStackBuilder {
     ipv6_gateway: Option<Ipv6Addr>,
 
     mtu: Option<usize>,
+    tcp_buf_cap: Option<usize>,
 }
 
 impl TcpStackBuilder {
@@ -117,6 +119,12 @@ impl TcpStackBuilder {
         self
     }
 
+    /// Set [TcpStream](tcp::TcpStream) inner buffer capacity, default is 8192
+    pub fn tcp_stream_buffer_capacity(&mut self, capacity: usize) -> &mut Self {
+        self.tcp_buf_cap = Some(capacity);
+        self
+    }
+
     /// Build a [`TcpStack`]
     pub fn build<C>(
         &self,
@@ -142,7 +150,7 @@ impl TcpStackBuilder {
             }
         };
 
-        TcpStack::new(connection, ipv4, ipv6, self.mtu)
+        TcpStack::new(connection, ipv4, ipv6, self.mtu, self.tcp_buf_cap)
     }
 }
 
@@ -201,6 +209,7 @@ impl<C> TcpStack<C> {
         ipv4: Option<(Ipv4Cidr, Ipv4Addr)>,
         ipv6: Option<(Ipv6Cidr, Ipv6Addr)>,
         mtu: Option<usize>,
+        tcp_buf_cap: Option<usize>,
     ) -> anyhow::Result<(Self, TcpAcceptor, UdpAcceptor)> {
         let mtu = mtu.unwrap_or(MTU);
 
@@ -228,6 +237,7 @@ impl<C> TcpStack<C> {
         let tcp_acceptor = TcpAcceptor {
             tcp_stream_rx: tcp_stream_rx.into_stream(),
             wake_event_tx: tx.clone(),
+            buf_cap: tcp_buf_cap.unwrap_or(TCP_BUF_CAP),
         };
         let udp_acceptor = UdpAcceptor {
             udp_stream_rx: udp_stream_rx.into_stream(),

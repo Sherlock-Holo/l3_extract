@@ -22,8 +22,6 @@ use super::wake_event::{
 use super::{create_share_waker, TcpInfo, TypedSocketHandle};
 use crate::notify_channel::NotifySender;
 
-const BUF_CAP: usize = 8 * 1024;
-
 enum ReadState {
     Buffer(BytesMut),
     WaitResult(Receiver<ReadPoll>),
@@ -453,6 +451,7 @@ impl Drop for TcpStream {
 pub struct TcpAcceptor {
     pub(crate) tcp_stream_rx: RecvStream<'static, io::Result<TcpInfo>>,
     pub(crate) wake_event_tx: NotifySender<WakeEvent>,
+    pub(crate) buf_cap: usize,
 }
 
 impl Debug for TcpAcceptor {
@@ -477,11 +476,11 @@ impl Stream for TcpAcceptor {
                 remote_addr: tcp_info.remote_addr,
                 handle: tcp_info.handle,
                 wake_event_tx: self.wake_event_tx.clone(),
-                read_buf_cap: BUF_CAP,
-                read_state: ReadState::Buffer(BytesMut::with_capacity(BUF_CAP)),
+                read_buf_cap: self.buf_cap,
+                read_state: ReadState::Buffer(BytesMut::with_capacity(self.buf_cap)),
                 read_waker: Default::default(),
-                write_buf_cap: BUF_CAP,
-                write_state: WriteState::Buffer(BytesMut::with_capacity(BUF_CAP)),
+                write_buf_cap: self.buf_cap,
+                write_state: WriteState::Buffer(BytesMut::with_capacity(self.buf_cap)),
                 write_waker: Arc::new(Default::default()),
                 close_state: CloseState::Opened,
                 close_waker: Arc::new(Default::default()),
