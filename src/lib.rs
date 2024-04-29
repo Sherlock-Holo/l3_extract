@@ -11,6 +11,9 @@
 //! [`TcpStream`] will use channel to communicate with the [`TcpStack`], and to improve
 //! performance, [`TcpStream`] has an inner buffer to reduce channel send.
 //!
+//! This crate put ease of use first, then performance, so it absolutely slower than kernel TCP
+//! network stack, also slower than use [`smoltcp`] with hand write event loop.
+//!
 //! ## Examples:
 //!
 //! ```no_run
