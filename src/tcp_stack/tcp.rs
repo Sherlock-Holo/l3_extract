@@ -82,9 +82,11 @@ pub struct TcpStream {
     handle: SocketHandle,
     wake_event_tx: NotifySender<WakeEvent>,
 
+    read_buf_cap: usize,
     read_state: ReadState,
     read_waker: Arc<AtomicWaker>,
 
+    write_buf_cap: usize,
     write_state: WriteState,
     write_waker: Arc<AtomicWaker>,
 
@@ -220,9 +222,13 @@ impl AsyncBufRead for TcpStream {
     }
 
     fn consume(mut self: Pin<&mut Self>, amt: usize) {
+        let cap = self.read_buf_cap;
         match &mut self.read_state {
             ReadState::Buffer(buf) => {
                 buf.advance(amt);
+                if !buf.has_remaining() {
+                    buf.reserve(cap);
+                }
             }
             ReadState::WaitResult(_) => {
                 panic!("TcpStream is not ready for read")
@@ -255,7 +261,7 @@ impl AsyncWrite for TcpStream {
                     return Poll::Ready(Ok(n));
                 }
 
-                match self.poll_flush(cx) {
+                match self.as_mut().poll_flush(cx) {
                     Poll::Pending => {
                         if n > 0 {
                             Poll::Ready(Ok(n))
@@ -267,7 +273,11 @@ impl AsyncWrite for TcpStream {
                     Poll::Ready(res) => {
                         res?;
 
-                        Poll::Ready(Ok(n))
+                        if n > 0 {
+                            Poll::Ready(Ok(n))
+                        } else {
+                            self.poll_write(cx, buf)
+                        }
                     }
                 }
             }
@@ -314,8 +324,11 @@ impl AsyncWrite for TcpStream {
                         self.poll_flush(cx)
                     }
 
-                    WritePoll::Ready { buf, result } => {
+                    WritePoll::Ready { mut buf, result } => {
                         let has_remaining = buf.has_remaining();
+                        if !has_remaining {
+                            buf.reserve(self.write_buf_cap);
+                        }
                         self.write_state = WriteState::Buffer(buf);
                         result?;
 
@@ -464,9 +477,11 @@ impl Stream for TcpAcceptor {
                 remote_addr: tcp_info.remote_addr,
                 handle: tcp_info.handle,
                 wake_event_tx: self.wake_event_tx.clone(),
+                read_buf_cap: BUF_CAP,
                 read_state: ReadState::Buffer(BytesMut::with_capacity(BUF_CAP)),
-                write_state: WriteState::Buffer(BytesMut::with_capacity(BUF_CAP)),
                 read_waker: Default::default(),
+                write_buf_cap: BUF_CAP,
+                write_state: WriteState::Buffer(BytesMut::with_capacity(BUF_CAP)),
                 write_waker: Arc::new(Default::default()),
                 close_state: CloseState::Opened,
                 close_waker: Arc::new(Default::default()),
