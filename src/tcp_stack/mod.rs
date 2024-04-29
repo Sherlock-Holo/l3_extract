@@ -1,3 +1,5 @@
+//! TCP network stack
+
 use std::collections::HashSet;
 use std::io;
 use std::io::ErrorKind;
@@ -72,6 +74,7 @@ pub(crate) struct UdpInfo {
     remote_addr: SocketAddr,
 }
 
+/// a [`TcpStack`] builder
 #[derive(Debug, Clone, Default)]
 pub struct TcpStackBuilder {
     ipv4_addr: Option<Ipv4Cidr>,
@@ -84,31 +87,37 @@ pub struct TcpStackBuilder {
 }
 
 impl TcpStackBuilder {
+    /// Set ipv4 addr
     pub fn ipv4_addr(&mut self, ipv4_addr: Ipv4Cidr) -> &mut Self {
         self.ipv4_addr = Some(ipv4_addr);
         self
     }
 
+    /// Set ipv4 gateway
     pub fn ipv4_gateway(&mut self, ipv4_gateway: Ipv4Addr) -> &mut Self {
         self.ipv4_gateway = Some(ipv4_gateway);
         self
     }
 
+    /// Set ipv6 addr
     pub fn ipv6_addr(&mut self, ipv6_addr: Ipv6Cidr) -> &mut Self {
         self.ipv6_addr = Some(ipv6_addr);
         self
     }
 
+    /// Set ipv6 gateway
     pub fn ipv6_gateway(&mut self, ipv6_gateway: Ipv6Addr) -> &mut Self {
         self.ipv6_gateway = Some(ipv6_gateway);
         self
     }
 
+    /// Set MTU, default is 1500
     pub fn mtu(&mut self, mtu: usize) -> &mut Self {
         self.mtu = Some(mtu);
         self
     }
 
+    /// Build a [`TcpStack`]
     pub fn build<C>(
         &self,
         connection: C,
@@ -137,6 +146,7 @@ impl TcpStackBuilder {
     }
 }
 
+/// TCP network stack
 pub struct TcpStack<C> {
     ipv4_addr: Option<Ipv4Addr>,
     ipv4_gateway: Option<Ipv4Addr>,
@@ -161,6 +171,31 @@ pub struct TcpStack<C> {
 }
 
 impl<C> TcpStack<C> {
+    /// Create a [`TcpStackBuilder`]
+    pub fn builder() -> TcpStackBuilder {
+        Default::default()
+    }
+
+    /// Get virtual interface ipv4 addr
+    pub fn iface_ipv4_addr(&self) -> Option<Ipv4Addr> {
+        self.ipv4_addr
+    }
+
+    /// Get virtual interface ipv4 gateway
+    pub fn iface_ipv4_gateway(&self) -> Option<Ipv4Addr> {
+        self.ipv4_gateway
+    }
+
+    /// Get virtual interface ipv6 addr
+    pub fn iface_ipv6_addr(&self) -> Option<Ipv6Addr> {
+        self.ipv6_addr
+    }
+
+    /// Get virtual interface ipv6 gateway
+    pub fn iface_ipv6_gateway(&self) -> Option<Ipv6Addr> {
+        self.ipv6_gateway
+    }
+
     fn new(
         connection: C,
         ipv4: Option<(Ipv4Cidr, Ipv4Addr)>,
@@ -221,27 +256,12 @@ impl<C> TcpStack<C> {
 }
 
 impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
+    /// Drive [`TcpStack`] run event loop
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let mut sleep = None;
         loop {
             sleep = self.drive_one(sleep).await?;
         }
-    }
-
-    pub fn iface_ipv4_addr(&self) -> Option<Ipv4Addr> {
-        self.ipv4_addr
-    }
-
-    pub fn iface_ipv4_gateway(&self) -> Option<Ipv4Addr> {
-        self.ipv4_gateway
-    }
-
-    pub fn iface_ipv6_addr(&self) -> Option<Ipv6Addr> {
-        self.ipv6_addr
-    }
-
-    pub fn iface_ipv6_gateway(&self) -> Option<Ipv6Addr> {
-        self.ipv6_gateway
     }
 
     #[instrument(level = "debug", skip(self), err(Debug))]

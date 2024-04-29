@@ -1,3 +1,5 @@
+//! TCP utility types
+
 use std::fmt::{Debug, Formatter};
 use std::io::ErrorKind;
 use std::net::SocketAddr;
@@ -64,6 +66,14 @@ enum CloseState {
     Closed,
 }
 
+/// A TCP stream, like tokio/async-net TcpStream
+///
+/// This TCP stream doesn't like normal [`std::net::TcpStream`] which accepted by
+/// [`std::net::TcpListener`], it is a **client** side TCP stream
+///
+/// ## Notes
+///
+/// You must call [flush](futures_util::AsyncWriteExt::flush) to make sure data is written to peer
 #[derive(Debug)]
 pub struct TcpStream {
     read_eof: bool,
@@ -83,10 +93,12 @@ pub struct TcpStream {
 }
 
 impl TcpStream {
+    /// Get local socket addr
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
+    /// Get peer socket addr
     pub fn peer_addr(&self) -> SocketAddr {
         self.remote_addr
     }
@@ -423,6 +435,8 @@ impl Drop for TcpStream {
     }
 }
 
+/// a TCP socket acceptor, like [`std::net::TcpListener`], but you will accept a client side TCP
+/// stream, not server side
 pub struct TcpAcceptor {
     pub(crate) tcp_stream_rx: RecvStream<'static, io::Result<TcpInfo>>,
     pub(crate) wake_event_tx: NotifySender<WakeEvent>,
@@ -431,7 +445,7 @@ pub struct TcpAcceptor {
 impl Debug for TcpAcceptor {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TcpAcceptor")
-            .field("tcp_stream_rx", &"{ ... }")
+            .field("tcp_stream_rx", &"{..}")
             .field("wake_event_tx", &self.wake_event_tx)
             .finish()
     }

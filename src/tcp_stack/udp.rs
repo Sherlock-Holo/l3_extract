@@ -1,3 +1,5 @@
+//! UDP utility types
+
 use std::fmt::{Debug, Formatter};
 use std::future::poll_fn;
 use std::io::ErrorKind;
@@ -57,6 +59,10 @@ impl Debug for SendState {
     }
 }
 
+/// A UDP socket, like tokio/async-net UdpSocket
+///
+/// This UDP socket is a **client** side UDP socket, like [`std::net::UdpSocket`] which has called
+/// [connect](std::net::UdpSocket::connect)
 #[derive(Debug)]
 pub struct UdpSocket {
     local_addr: SocketAddr,
@@ -73,18 +79,22 @@ pub struct UdpSocket {
 }
 
 impl UdpSocket {
+    /// Get local socket addr
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
+    /// Get peer socket addr
     pub fn peer_addr(&self) -> SocketAddr {
         self.remote_addr
     }
 
+    /// Send payload capacity, if send data size is large than that, will return error
     pub fn send_payload_capacity(&self) -> usize {
         self.send_payload_capacity
     }
 
+    /// Receive data with buffer from peer, will return actually receive size
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         let mut read_state = self.read_state.lock().await;
 
@@ -166,6 +176,7 @@ impl UdpSocket {
         }).await
     }
 
+    /// Send data to peer, will return sent size
     pub async fn send(&self, data: &[u8]) -> io::Result<usize> {
         if data.len() > self.send_payload_capacity {
             return Err(io::Error::new(
@@ -262,6 +273,8 @@ impl Drop for UdpSocket {
     }
 }
 
+/// a UDP socket acceptor, like [TcpAcceptor](super::tcp::TcpAcceptor), but you will accept a
+/// client side UDP socket, not server side
 pub struct UdpAcceptor {
     pub(crate) udp_stream_rx: RecvStream<'static, io::Result<UdpInfo>>,
     pub(crate) wake_event_tx: NotifySender<WakeEvent>,
@@ -270,7 +283,7 @@ pub struct UdpAcceptor {
 impl Debug for UdpAcceptor {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UdpAcceptor")
-            .field("udp_stream_rx", &"{ ... }")
+            .field("udp_stream_rx", &"{..}")
             .field("wake_event_tx", &self.wake_event_tx)
             .finish()
     }
