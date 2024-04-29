@@ -1,6 +1,5 @@
 //! UDP utility types
 
-use std::fmt::{Debug, Formatter};
 use std::future::poll_fn;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
@@ -11,6 +10,7 @@ use std::{io, mem};
 
 use bytes::{Buf, BytesMut};
 use crossbeam_channel::{Receiver, TryRecvError};
+use derivative::Derivative;
 use flume::r#async::RecvStream;
 use futures_util::lock::Mutex;
 use futures_util::task::AtomicWaker;
@@ -24,39 +24,18 @@ use super::wake_event::{
 use super::{create_share_waker, TypedSocketHandle, UdpInfo};
 use crate::notify_channel::NotifySender;
 
+#[derive(Derivative)]
+#[derivative(Debug)]
 enum RecvState {
-    Buffer(BytesMut),
+    Buffer(#[derivative(Debug = "ignore")] BytesMut),
     WaitResult(Receiver<ReadPoll>),
 }
 
-impl Debug for RecvState {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RecvState::Buffer(_) => f.debug_struct("RecvState::Buffer").finish_non_exhaustive(),
-
-            RecvState::WaitResult(receiver) => f
-                .debug_struct("RecvState::WaitResult")
-                .field("receiver", receiver)
-                .finish(),
-        }
-    }
-}
-
+#[derive(Derivative)]
+#[derivative(Debug)]
 enum SendState {
-    Buffer(BytesMut),
+    Buffer(#[derivative(Debug = "ignore")] BytesMut),
     Sending(Receiver<WritePoll>),
-}
-
-impl Debug for SendState {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SendState::Buffer(_) => f.debug_struct("SendState::Buffer").finish_non_exhaustive(),
-            SendState::Sending(rx) => f
-                .debug_struct("SendState::Sending")
-                .field("receiver", rx)
-                .finish(),
-        }
-    }
 }
 
 /// A UDP socket, like tokio/async-net UdpSocket
@@ -275,18 +254,12 @@ impl Drop for UdpSocket {
 
 /// a UDP socket acceptor, like [TcpAcceptor](super::tcp::TcpAcceptor), but you will accept a
 /// client side UDP socket, not server side
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct UdpAcceptor {
+    #[derivative(Debug = "ignore")]
     pub(crate) udp_stream_rx: RecvStream<'static, io::Result<UdpInfo>>,
     pub(crate) wake_event_tx: NotifySender<WakeEvent>,
-}
-
-impl Debug for UdpAcceptor {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UdpAcceptor")
-            .field("udp_stream_rx", &"{..}")
-            .field("wake_event_tx", &self.wake_event_tx)
-            .finish()
-    }
 }
 
 impl Stream for UdpAcceptor {

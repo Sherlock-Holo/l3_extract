@@ -1,6 +1,5 @@
 //! TCP utility types
 
-use std::fmt::{Debug, Formatter};
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -10,6 +9,7 @@ use std::{io, mem};
 
 use bytes::{Buf, BytesMut};
 use crossbeam_channel::{Receiver, TryRecvError};
+use derivative::Derivative;
 use flume::r#async::RecvStream;
 use futures_util::task::AtomicWaker;
 use futures_util::{AsyncBufRead, AsyncRead, AsyncWrite, Stream, StreamExt};
@@ -22,39 +22,18 @@ use super::wake_event::{
 use super::{create_share_waker, TcpInfo, TypedSocketHandle};
 use crate::notify_channel::NotifySender;
 
+#[derive(Derivative)]
+#[derivative(Debug)]
 enum ReadState {
-    Buffer(BytesMut),
+    Buffer(#[derivative(Debug = "ignore")] BytesMut),
     WaitResult(Receiver<ReadPoll>),
 }
 
-impl Debug for ReadState {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ReadState::Buffer(_) => f.debug_struct("ReadState::Buffer").finish_non_exhaustive(),
-
-            ReadState::WaitResult(receiver) => f
-                .debug_struct("ReadState::WaitResult")
-                .field("receiver", receiver)
-                .finish(),
-        }
-    }
-}
-
+#[derive(Derivative)]
+#[derivative(Debug)]
 enum WriteState {
-    Buffer(BytesMut),
+    Buffer(#[derivative(Debug = "ignore")] BytesMut),
     Flushing(Receiver<WritePoll>),
-}
-
-impl Debug for WriteState {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WriteState::Buffer(_) => f.debug_struct("WriteState::Buffer").finish_non_exhaustive(),
-            WriteState::Flushing(rx) => f
-                .debug_struct("WriteState::Flushing")
-                .field("receiver", rx)
-                .finish(),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -448,19 +427,13 @@ impl Drop for TcpStream {
 
 /// a TCP socket acceptor, like [`std::net::TcpListener`], but you will accept a client side TCP
 /// stream, not server side
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct TcpAcceptor {
+    #[derivative(Debug = "ignore")]
     pub(crate) tcp_stream_rx: RecvStream<'static, io::Result<TcpInfo>>,
     pub(crate) wake_event_tx: NotifySender<WakeEvent>,
     pub(crate) buf_cap: usize,
-}
-
-impl Debug for TcpAcceptor {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TcpAcceptor")
-            .field("tcp_stream_rx", &"{..}")
-            .field("wake_event_tx", &self.wake_event_tx)
-            .finish()
-    }
 }
 
 impl Stream for TcpAcceptor {
