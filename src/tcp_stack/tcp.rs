@@ -1,7 +1,9 @@
 //! TCP utility types
 
-use std::io::ErrorKind;
+use std::cell::UnsafeCell;
+use std::io::{ErrorKind, IoSlice, IoSliceMut};
 use std::net::SocketAddr;
+use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
@@ -80,6 +82,18 @@ impl TcpStream {
     /// Get peer socket addr
     pub fn peer_addr(&self) -> SocketAddr {
         self.remote_addr
+    }
+
+    /// Split a [`TcpStream`] into two halves: [`ReadHalf`] and [`WriteHalf`]
+    pub fn split(self) -> (ReadHalf, WriteHalf) {
+        let tcp_stream = Arc::new(SendSyncUnsafeCellTcpStream(UnsafeCell::new(self)));
+
+        (
+            ReadHalf {
+                tcp_stream: tcp_stream.clone(),
+            },
+            WriteHalf { tcp_stream },
+        )
     }
 
     fn inner_poll_fill_buf(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
@@ -425,7 +439,125 @@ impl Drop for TcpStream {
     }
 }
 
-/// a TCP socket acceptor, like [`std::net::TcpListener`], but you will accept a client side TCP
+#[repr(transparent)]
+struct SendSyncUnsafeCellTcpStream(UnsafeCell<TcpStream>);
+
+// Safety: TcpStream is Sync and Send, and we don't have data race
+unsafe impl Send for SendSyncUnsafeCellTcpStream {}
+
+unsafe impl Sync for SendSyncUnsafeCellTcpStream {}
+
+impl Deref for SendSyncUnsafeCellTcpStream {
+    type Target = UnsafeCell<TcpStream>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for SendSyncUnsafeCellTcpStream {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// The readable half of a [`TcpStream`]
+pub struct ReadHalf {
+    tcp_stream: Arc<SendSyncUnsafeCellTcpStream>,
+}
+
+impl ReadHalf {
+    /// Attempts to put the two “halves” of a split [`TcpStream`] back together.
+    pub fn reunite(self, write_half: WriteHalf) -> Result<TcpStream, (Self, WriteHalf)> {
+        if Arc::ptr_eq(&self.tcp_stream, &write_half.tcp_stream) {
+            drop(write_half);
+
+            Ok(Arc::into_inner(self.tcp_stream)
+                .expect("there are other Arc<UnsafeCell<TcpStream>> but that should not happened")
+                .0
+                .into_inner())
+        } else {
+            Err((self, write_half))
+        }
+    }
+
+    fn pin_mut_tcp_stream(self: Pin<&mut Self>) -> Pin<&mut TcpStream> {
+        // Safety: ReadHalf::poll_read require Pin<&mut Self>, and it won't use WriteHalf data and
+        // other fields only use ref not mut ref
+        let tcp_stream = unsafe { &mut *self.tcp_stream.get() };
+        Pin::new(tcp_stream)
+    }
+}
+
+impl AsyncRead for ReadHalf {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        self.pin_mut_tcp_stream().poll_read(cx, buf)
+    }
+
+    fn poll_read_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.pin_mut_tcp_stream().poll_read_vectored(cx, bufs)
+    }
+}
+
+impl AsyncBufRead for ReadHalf {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        self.pin_mut_tcp_stream().poll_fill_buf(cx)
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        self.pin_mut_tcp_stream().consume(amt)
+    }
+}
+
+/// The writeable half of a [`TcpStream`]
+pub struct WriteHalf {
+    tcp_stream: Arc<SendSyncUnsafeCellTcpStream>,
+}
+
+impl WriteHalf {
+    fn pin_mut_tcp_stream(self: Pin<&mut Self>) -> Pin<&mut TcpStream> {
+        // Safety: WriteHalf::poll_write require Pin<&mut Self>, and it won't use ReadHalf data and
+        // other fields only use ref not mut ref
+        let tcp_stream = unsafe { &mut *self.tcp_stream.get() };
+        Pin::new(tcp_stream)
+    }
+}
+
+impl AsyncWrite for WriteHalf {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.pin_mut_tcp_stream().poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.pin_mut_tcp_stream().poll_write_vectored(cx, bufs)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.pin_mut_tcp_stream().poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.pin_mut_tcp_stream().poll_close(cx)
+    }
+}
+
+/// A TCP socket acceptor, like [`std::net::TcpListener`], but you will accept a client side TCP
 /// stream, not server side
 #[derive(Derivative)]
 #[derivative(Debug)]

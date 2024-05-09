@@ -581,7 +581,7 @@ checksum = "8bd11f3a29434026f5ff98c730b668ba74b1033637b8817940b54d040696133c"
 
 [[package]]
 name = "l3_extract"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-global-executor",
