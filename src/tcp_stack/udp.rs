@@ -1,42 +1,20 @@
 //! UDP utility types
 
-use std::future::poll_fn;
+use std::io;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{ready, Context, Poll};
-use std::{io, mem};
 
-use bytes::{Buf, BytesMut};
-use crossbeam_channel::{Receiver, TryRecvError};
+use crossbeam_channel::SendError;
 use derivative::Derivative;
 use flume::r#async::RecvStream;
-use futures_util::lock::Mutex;
-use futures_util::task::AtomicWaker;
 use futures_util::{Stream, StreamExt};
 use smoltcp::iface::SocketHandle;
-use tracing::error;
 
-use super::wake_event::{
-    CloseEvent, ReadPoll, ReadWakeEvent, WakeEvent, WritePoll, WriteWakeEvent,
-};
-use super::{create_share_waker, TypedSocketHandle, UdpInfo};
+use super::wake_event::OperationEvent;
+use super::{TypedSocketHandle, UdpInfo};
 use crate::notify_channel::NotifySender;
-
-#[derive(Derivative)]
-#[derivative(Debug)]
-enum RecvState {
-    Buffer(#[derivative(Debug = "ignore")] BytesMut),
-    WaitResult(Receiver<ReadPoll>),
-}
-
-#[derive(Derivative)]
-#[derivative(Debug)]
-enum SendState {
-    Buffer(#[derivative(Debug = "ignore")] BytesMut),
-    Sending(Receiver<WritePoll>),
-}
 
 /// A UDP socket, like tokio/async-net UdpSocket
 ///
@@ -47,14 +25,8 @@ pub struct UdpSocket {
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
     handle: SocketHandle,
-    send_payload_capacity: usize,
-    wake_event_tx: NotifySender<WakeEvent>,
-
-    read_state: Mutex<RecvState>,
-    read_waker: Arc<AtomicWaker>,
-
-    write_state: Mutex<SendState>,
-    write_waker: Arc<AtomicWaker>,
+    read_part: ReadPart,
+    write_part: WritePart,
 }
 
 impl UdpSocket {
@@ -68,187 +40,133 @@ impl UdpSocket {
         self.remote_addr
     }
 
-    /// Send payload capacity, if send data size is large than that, will return error
-    pub fn send_payload_capacity(&self) -> usize {
-        self.send_payload_capacity
+    pub async fn recv(&self, buf: Vec<u8>) -> (io::Result<usize>, Option<Vec<u8>>) {
+        self.read_part
+            .read(buf, self.handle, self.local_addr, self.remote_addr)
+            .await
     }
 
-    /// Receive data with buffer from peer, will return actually receive size
-    pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut read_state = self.read_state.lock().await;
-
-        poll_fn(|cx| {
-            loop {
-                match &*read_state {
-                    RecvState::Buffer(_) => {
-                        let (tx, rx) = crossbeam_channel::bounded(1);
-                        let read_state = mem::replace(&mut *read_state, RecvState::WaitResult(rx));
-                        let buf = match read_state {
-                            RecvState::Buffer(buf) => buf,
-                            _ => unreachable!(),
-                        };
-
-                        self.read_waker.register(cx.waker());
-                        if self
-                            .wake_event_tx
-                            .send(WakeEvent::Read(ReadWakeEvent {
-                                handle: TypedSocketHandle::Udp { handle: self.handle, src: self.local_addr, dst: self.remote_addr },
-                                buffer: buf,
-                                waker: create_share_waker(self.read_waker.clone()),
-                                respond: tx,
-                            }))
-                            .is_err()
-                        {
-                            error!("TcpStack may be dropped, send wake event failed");
-
-                            return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)));
-                        }
-
-                        return Poll::Pending;
-                    }
-
-                    RecvState::WaitResult(rx) => {
-                        self.read_waker.register(cx.waker());
-
-                        let read_poll = match rx.try_recv() {
-                            Err(TryRecvError::Empty) => return Poll::Pending,
-                            Err(TryRecvError::Disconnected) => {
-                                error!("TcpStack may be dropped, try receive wake event response failed");
-
-                                return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)));
-                            }
-                            Ok(read_poll) => read_poll,
-                        };
-
-                        match read_poll {
-                            ReadPoll::Pending(buf) => {
-                                *read_state = RecvState::Buffer(buf);
-
-                                // tcp stack wake but in earlier udp socket not ready, so we need to
-                                // poll again
-                                continue;
-                            }
-
-                            ReadPoll::Ready { buf: mut inner_buf, result } => {
-                                return match result {
-                                    Ok(_) => {
-                                        let n = inner_buf.len().min(buf.len());
-                                        inner_buf.copy_to_slice(&mut buf[..n]);
-                                        inner_buf.clear();
-
-                                        *read_state = RecvState::Buffer(inner_buf);
-
-                                        Poll::Ready(Ok(n))
-                                    }
-
-                                    Err(err) => {
-                                        *read_state = RecvState::Buffer(inner_buf);
-
-                                        Poll::Ready(Err(err))
-                                    }
-                                };
-                            }
-                        }
-                    }
-                }
-            }
-        }).await
-    }
-
-    /// Send data to peer, will return sent size
-    pub async fn send(&self, data: &[u8]) -> io::Result<usize> {
-        if data.len() > self.send_payload_capacity {
-            return Err(io::Error::new(
-                ErrorKind::Other,
-                format!(
-                    "data size is larger than send payload capacity: {}",
-                    self.send_payload_capacity
-                ),
-            ));
-        }
-
-        let mut write_state = self.write_state.lock().await;
-
-        let mut copied = false;
-        poll_fn(|cx| {
-            loop {
-                match &*write_state {
-                    SendState::Buffer(_) => {
-                        let (tx, rx) = crossbeam_channel::bounded(1);
-                        let write_state = mem::replace(&mut *write_state, SendState::Sending(rx));
-                        let mut buf = match write_state {
-                            SendState::Buffer(buf) => buf,
-                            _ => unreachable!(),
-                        };
-
-                        // avoid unnecessary copy
-                        if !copied {
-                            buf.extend_from_slice(data);
-                            copied = true;
-                        }
-
-                        self.write_waker.register(cx.waker());
-
-                        if self.wake_event_tx.send(WakeEvent::Write(WriteWakeEvent {
-                            handle: TypedSocketHandle::Udp { handle: self.handle, src: self.local_addr, dst: self.remote_addr },
-                            data: buf,
-                            waker: create_share_waker(self.write_waker.clone()),
-                            respond: tx,
-                        })).is_err() {
-                            error!("TcpStack may be dropped, send wake event failed");
-
-                            return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)));
-                        }
-
-                        return Poll::Pending;
-                    }
-
-                    SendState::Sending(rx) => {
-                        self.write_waker.register(cx.waker());
-
-                        let write_poll = match rx.try_recv() {
-                            Err(TryRecvError::Empty) => return Poll::Pending,
-                            Err(TryRecvError::Disconnected) => {
-                                error!("TcpStack may be dropped, try receive wake event response failed");
-
-                                return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)));
-                            }
-                            Ok(write_poll) => write_poll,
-                        };
-
-                        match write_poll {
-                            WritePoll::Pending(buf) => {
-                                *write_state = SendState::Buffer(buf);
-
-                                // tcp stack wake but in earlier udp socket not ready, so we need
-                                // to poll again
-                                continue;
-                            }
-
-                            WritePoll::Ready { buf, result } => {
-                                *write_state = SendState::Buffer(buf);
-
-                                return Poll::Ready(result);
-                            }
-                        }
-                    }
-                }
-            }
-        }).await?;
-
-        Ok(data.len())
+    pub async fn send(&self, buf: Vec<u8>) -> (io::Result<usize>, Option<Vec<u8>>) {
+        self.write_part
+            .write(buf, self.handle, self.local_addr, self.remote_addr)
+            .await
     }
 }
 
 impl Drop for UdpSocket {
     fn drop(&mut self) {
-        let _ = self.wake_event_tx.send(WakeEvent::Close(CloseEvent {
-            handle: TypedSocketHandle::Udp {
+        let _ = self
+            .write_part
+            .operation_event_tx
+            .send(OperationEvent::Close(TypedSocketHandle::Udp {
                 handle: self.handle,
                 src: self.local_addr,
                 dst: self.remote_addr,
+            }));
+    }
+}
+
+#[derive(Debug)]
+struct WritePart {
+    operation_event_tx: NotifySender<OperationEvent>,
+}
+
+impl WritePart {
+    async fn write(
+        &self,
+        buf: Vec<u8>,
+        handle: SocketHandle,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+    ) -> (io::Result<usize>, Option<Vec<u8>>) {
+        let (tx, rx) = flume::bounded(1);
+        if let Err(SendError(event)) = self.operation_event_tx.send(OperationEvent::Write {
+            handle: TypedSocketHandle::Udp {
+                handle,
+                src: local_addr,
+                dst: remote_addr,
             },
-        }));
+            buffer: buf,
+            result_tx: tx,
+        }) {
+            match event {
+                OperationEvent::Write { buffer, .. } => {
+                    return (
+                        Err(io::Error::new(
+                            ErrorKind::BrokenPipe,
+                            "TcpStack may be dropped, send write operation event failed",
+                        )),
+                        Some(buffer),
+                    );
+                }
+
+                _ => unreachable!(),
+            }
+        }
+
+        match rx.recv_async().await {
+            Err(_) => (
+                Err(io::Error::new(
+                    ErrorKind::BrokenPipe,
+                    "TcpStack may be dropped, receive write operation response failed",
+                )),
+                None,
+            ),
+
+            Ok((res, buf)) => (res, Some(buf)),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ReadPart {
+    operation_event_tx: NotifySender<OperationEvent>,
+}
+
+impl ReadPart {
+    async fn read(
+        &self,
+        buf: Vec<u8>,
+        handle: SocketHandle,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+    ) -> (io::Result<usize>, Option<Vec<u8>>) {
+        let (tx, rx) = flume::bounded(1);
+        if let Err(SendError(event)) = self.operation_event_tx.send(OperationEvent::Read {
+            handle: TypedSocketHandle::Udp {
+                handle,
+                src: local_addr,
+                dst: remote_addr,
+            },
+            buffer: buf,
+            result_tx: tx,
+        }) {
+            match event {
+                OperationEvent::Read { buffer, .. } => {
+                    return (
+                        Err(io::Error::new(
+                            ErrorKind::BrokenPipe,
+                            "TcpStack may be dropped, send read operation event failed",
+                        )),
+                        Some(buffer),
+                    );
+                }
+
+                _ => unreachable!(),
+            }
+        }
+
+        match rx.recv_async().await {
+            Err(_) => (
+                Err(io::Error::new(
+                    ErrorKind::BrokenPipe,
+                    "TcpStack may be dropped, receive read operation response failed",
+                )),
+                None,
+            ),
+
+            Ok((res, buf)) => (res, Some(buf)),
+        }
     }
 }
 
@@ -259,7 +177,7 @@ impl Drop for UdpSocket {
 pub struct UdpAcceptor {
     #[derivative(Debug = "ignore")]
     pub(crate) udp_stream_rx: RecvStream<'static, io::Result<UdpInfo>>,
-    pub(crate) wake_event_tx: NotifySender<WakeEvent>,
+    pub(crate) operation_event_tx: NotifySender<OperationEvent>,
 }
 
 impl Stream for UdpAcceptor {
@@ -273,16 +191,12 @@ impl Stream for UdpAcceptor {
                 local_addr: udp_info.local_addr,
                 remote_addr: udp_info.remote_addr,
                 handle: udp_info.handle,
-                send_payload_capacity: udp_info.send_payload_capacity,
-                wake_event_tx: self.wake_event_tx.clone(),
-                read_state: Mutex::new(RecvState::Buffer(BytesMut::with_capacity(
-                    udp_info.recv_payload_capacity,
-                ))),
-                write_state: Mutex::new(SendState::Buffer(BytesMut::with_capacity(
-                    udp_info.send_payload_capacity,
-                ))),
-                read_waker: Default::default(),
-                write_waker: Arc::new(Default::default()),
+                read_part: ReadPart {
+                    operation_event_tx: self.operation_event_tx.clone(),
+                },
+                write_part: WritePart {
+                    operation_event_tx: self.operation_event_tx.clone(),
+                },
             }))),
         }
     }
