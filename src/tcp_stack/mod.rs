@@ -172,6 +172,7 @@ pub struct TcpStack<C> {
 
     socket_set: SocketSet<'static>,
     socket_handles: HashSet<TypedSocketHandle>,
+    connected_udp_sockets: HashSet<(SocketAddr, SocketAddr)>,
 
     wake_events_tx: NotifySender<WakeEvent>,
     wake_events: NotifyReceiver<WakeEvent>,
@@ -257,6 +258,7 @@ impl<C> TcpStack<C> {
             virtual_iface,
             socket_set: SocketSet::new(vec![]),
             socket_handles: Default::default(),
+            connected_udp_sockets: Default::default(),
             wake_events_tx: tx.clone(),
             wake_events: rx,
             tcp_stream_tx,
@@ -735,6 +737,7 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
     #[instrument(level = "debug", skip(self))]
     fn remove_udp_socket(&mut self, handle: SocketHandle, src: SocketAddr, dst: SocketAddr) {
         self.socket_set.remove(handle);
+        self.connected_udp_sockets.remove(&(src, dst));
         self.socket_handles
             .remove(&TypedSocketHandle::Udp { handle, src, dst });
     }
@@ -795,11 +798,18 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
 
     #[instrument(level = "debug", skip(self), err(Debug))]
     fn try_init_udp(&mut self, src: SocketAddr, dst: SocketAddr) -> anyhow::Result<()> {
+        if self.connected_udp_sockets.contains(&(src, dst)) {
+            debug!("ignore connected udp");
+
+            return Ok(());
+        }
+
         let mut socket = create_udp_socket(SOCKET_BUF_SIZE);
         socket.bind(dst).with_context(|| "udp socket bind failed")?;
         let handle = self.socket_set.add(socket);
         let typed_handle = TypedSocketHandle::Udp { handle, src, dst };
         self.socket_handles.insert(typed_handle);
+        self.connected_udp_sockets.insert((src, dst));
 
         self.wake_events_tx.send(WakeEvent::Ready(ReadyEvent {
             handle: typed_handle,
