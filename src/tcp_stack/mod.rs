@@ -192,6 +192,14 @@ impl<C> TcpStack<C> {
         self.ipv6_gateway
     }
 
+    pub fn connection_ref(&self) -> &C {
+        &self.tun_connection
+    }
+
+    pub fn connection_mut(&mut self) -> &mut C {
+        &mut self.tun_connection
+    }
+
     fn new(
         connection: C,
         ipv4: Option<(Ipv4Cidr, Ipv4Addr)>,
