@@ -68,3 +68,28 @@ pub enum WakeEvent {
     Shutdown(ShutdownEvent),
     Close(CloseEvent),
 }
+
+#[derive(Derivative)]
+#[derivative(Debug)]
+pub enum OperationEvent {
+    Read {
+        handle: TypedSocketHandle,
+        #[derivative(Debug = "ignore")]
+        buffer: Vec<u8>,
+        result_tx: flume::Sender<(io::Result<usize>, Vec<u8>)>,
+    },
+
+    Write {
+        handle: TypedSocketHandle,
+        #[derivative(Debug = "ignore")]
+        buffer: Vec<u8>,
+        result_tx: flume::Sender<(io::Result<usize>, Vec<u8>)>,
+    },
+
+    Shutdown {
+        handle: TypedSocketHandle,
+        result_tx: flume::Sender<io::Result<()>>,
+    },
+
+    Close(TypedSocketHandle),
+}

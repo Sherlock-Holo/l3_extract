@@ -33,7 +33,9 @@ use crate::virtual_interface::VirtualInterface;
 use crate::wake_fn::{wake_fn, wake_once_fn};
 
 pub mod tcp;
+pub mod tcp2;
 pub mod udp;
+pub mod udp2;
 mod wake_event;
 
 const SOCKET_BUF_SIZE: usize = 16 * 1024;
