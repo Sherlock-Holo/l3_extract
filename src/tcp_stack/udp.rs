@@ -40,12 +40,14 @@ impl UdpSocket {
         self.remote_addr
     }
 
+    /// Receives a single datagram message on the [`UdpSocket`]
     pub async fn recv(&self, buf: Vec<u8>) -> (io::Result<usize>, Option<Vec<u8>>) {
         self.read_part
             .read(buf, self.handle, self.local_addr, self.remote_addr)
             .await
     }
 
+    /// Sends data on the [`UdpSocket`]
     pub async fn send(&self, buf: Vec<u8>) -> (io::Result<usize>, Option<Vec<u8>>) {
         self.write_part
             .write(buf, self.handle, self.local_addr, self.remote_addr)

@@ -48,10 +48,13 @@ impl TcpStream {
         self.read_part.read(buf, self.handle).await
     }
 
+    /// Write a buffer into this [`TcpStream`], returning how many bytes were written and buffer
+    /// itself.
     pub async fn write(&self, buf: Vec<u8>) -> (io::Result<usize>, Option<Vec<u8>>) {
         self.write_part.write(buf, self.handle).await
     }
 
+    /// Shuts down the write halves of this connection.
     pub async fn shutdown(&self) -> io::Result<()> {
         self.write_part.shutdown(self.handle).await
     }
@@ -68,7 +71,6 @@ impl Drop for TcpStream {
 
 #[derive(Debug)]
 struct WritePart {
-    is_shutdown: bool,
     operation_event_tx: NotifySender<OperationEvent>,
 }
 
@@ -78,12 +80,6 @@ impl WritePart {
         buf: Vec<u8>,
         handle: SocketHandle,
     ) -> (io::Result<usize>, Option<Vec<u8>>) {
-        if self.is_shutdown {
-            return (
-                Err(io::Error::new(ErrorKind::BrokenPipe, "TcpStream is closed")),
-                Some(buf),
-            );
-        }
         if buf.is_empty() {
             return (Ok(0), Some(buf));
         }
@@ -153,7 +149,6 @@ impl WritePart {
 
 #[derive(Debug)]
 struct ReadPart {
-    read_eof: bool,
     operation_event_tx: NotifySender<OperationEvent>,
 }
 
@@ -163,12 +158,6 @@ impl ReadPart {
         buf: Vec<u8>,
         handle: SocketHandle,
     ) -> (io::Result<usize>, Option<Vec<u8>>) {
-        if self.read_eof {
-            return (
-                Err(io::Error::new(ErrorKind::BrokenPipe, "TcpStream is closed")),
-                Some(buf),
-            );
-        }
         if buf.is_empty() {
             return (Ok(0), Some(buf));
         }
@@ -230,11 +219,9 @@ impl Stream for TcpAcceptor {
                 remote_addr: tcp_info.remote_addr,
                 handle: tcp_info.handle,
                 read_part: ReadPart {
-                    read_eof: false,
                     operation_event_tx: self.operation_event_tx.clone(),
                 },
                 write_part: WritePart {
-                    is_shutdown: false,
                     operation_event_tx: self.operation_event_tx.clone(),
                 },
             }))),
