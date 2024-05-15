@@ -451,7 +451,7 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                 }
 
                 let local_addr = socket
-                    .local_endpoint()
+                    .remote_endpoint()
                     .unwrap_or_else(|| panic!("tcp socket {handle} doesn't have local addr"));
                 let local_addr = SocketAddr::new(local_addr.addr.into(), local_addr.port);
                 let remote_addr = socket
