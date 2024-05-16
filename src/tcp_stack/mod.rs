@@ -1,12 +1,13 @@
 //! TCP network stack
 
 use std::collections::HashSet;
-use std::io;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::Duration;
+use std::{io, slice};
 
 use anyhow::Context as _;
+use compio_buf::{IoBuf, IoBufMut, SetBufInit};
 use crossbeam_channel::SendError;
 use flume::Sender;
 use futures_timer::Delay;
@@ -534,7 +535,7 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                     return;
                 }
 
-                match socket.send_slice(&buffer) {
+                match socket.send_slice(buffer.as_slice()) {
                     Err(err) => {
                         error!(?err, "send data failed");
 
@@ -604,20 +605,28 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                     return;
                 }
 
-                let res = socket.recv_slice(&mut buffer);
-                match res {
-                    Err(RecvError::Finished) => {
-                        // when tcp read eof, still return the buffer
-                        let _ = result_tx.send((Ok(0), buffer));
-                    }
+                // Safety: we won't read the uninitiated buffer and set the correct new len
+                unsafe {
+                    let uninitiated_buffer =
+                        slice::from_raw_parts_mut(buffer.as_buf_mut_ptr(), buffer.buf_capacity());
+                    let res = socket.recv_slice(uninitiated_buffer);
+                    match res {
+                        Err(RecvError::Finished) => {
+                            // when tcp read eof, still return the buffer
+                            let _ = result_tx.send((Ok(0), buffer));
+                        }
 
-                    Err(err) => {
-                        let _ =
-                            result_tx.send((Err(io::Error::new(ErrorKind::Other, err)), buffer));
-                    }
+                        Err(err) => {
+                            let _ = result_tx
+                                .send((Err(io::Error::new(ErrorKind::Other, err)), buffer));
+                        }
 
-                    Ok(n) => {
-                        let _ = result_tx.send((Ok(n), buffer));
+                        Ok(n) => {
+                            let new_len = buffer.buf_len() + n;
+                            buffer.set_buf_init(new_len);
+
+                            let _ = result_tx.send((Ok(n), buffer));
+                        }
                     }
                 }
             }
@@ -661,13 +670,14 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                 if !socket.can_send() {
                     let tx = self.operation_event_tx.clone();
                     socket.register_send_waker(&wake_once_fn(move || {
-                        if let Err(SendError(event)) = tx.send(OperationEvent::Write {
+                        if let Err(SendError(event)) = tx.send(OperationEvent::Send {
                             handle,
+                            src,
                             buffer,
                             result_tx,
                         }) {
                             match event {
-                                OperationEvent::Write {
+                                OperationEvent::Send {
                                     buffer, result_tx, ..
                                 } => {
                                     let _ = result_tx.send((
@@ -687,7 +697,7 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                     return;
                 }
 
-                match socket.send_slice(&buffer, src) {
+                match socket.send_slice(buffer.as_slice(), src) {
                     Err(err) => {
                         error!(?err, "send data failed");
 
@@ -696,7 +706,7 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                     }
 
                     Ok(_) => {
-                        let _ = result_tx.send((Ok(buffer.len()), buffer));
+                        let _ = result_tx.send((Ok(buffer.buf_len()), buffer));
                     }
                 }
             }
@@ -727,7 +737,7 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                             result_tx,
                         }) {
                             match event {
-                                OperationEvent::Read {
+                                OperationEvent::Recv {
                                     buffer, result_tx, ..
                                 } => {
                                     let _ = result_tx.send((
@@ -747,16 +757,27 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                     return;
                 }
 
-                match socket.recv_slice(&mut buffer) {
-                    Err(err) => {
-                        let _ =
-                            result_tx.send((Err(io::Error::new(ErrorKind::Other, err)), buffer));
-                    }
+                // Safety: we won't read the uninitiated buffer and set the correct new len
+                unsafe {
+                    let uninitiated_buffer =
+                        slice::from_raw_parts_mut(buffer.as_buf_mut_ptr(), buffer.buf_capacity());
+                    match socket.recv_slice(uninitiated_buffer) {
+                        Err(err) => {
+                            let _ = result_tx
+                                .send((Err(io::Error::new(ErrorKind::Other, err)), buffer));
+                        }
 
-                    Ok((n, metadata)) => {
-                        let addr =
-                            SocketAddr::new(metadata.endpoint.addr.into(), metadata.endpoint.port);
-                        let _ = result_tx.send((Ok((n, addr)), buffer));
+                        Ok((n, metadata)) => {
+                            let addr = SocketAddr::new(
+                                metadata.endpoint.addr.into(),
+                                metadata.endpoint.port,
+                            );
+
+                            let new_len = buffer.buf_len() + n;
+                            buffer.set_buf_init(new_len);
+
+                            let _ = result_tx.send((Ok((n, addr)), buffer));
+                        }
                     }
                 }
             }
@@ -850,7 +871,8 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
         self.accepted_udp_sockets.insert(dst);
 
         self.operation_event_tx
-            .send(OperationEvent::Ready(typed_handle))?;
+            .send(OperationEvent::Ready(typed_handle))
+            .map_err(|_| anyhow::anyhow!("send udp ready event failed"))?;
 
         Ok(true)
     }
@@ -1053,4 +1075,12 @@ fn ipv6_init_interface(
         .add_default_ipv6_route(gateway.into())?;
 
     Ok(())
+}
+
+unsafe fn cast_dyn_io_buf<T: IoBuf>(buf: Box<dyn IoBuf>) -> T {
+    *Box::from_raw(Box::into_raw(buf).cast())
+}
+
+unsafe fn cast_dyn_io_buf_mut<T: IoBufMut>(buf: Box<dyn IoBufMut>) -> T {
+    *Box::from_raw(Box::into_raw(buf).cast())
 }

@@ -1,12 +1,16 @@
 use std::io;
 use std::net::SocketAddr;
 
+use compio_buf::{IoBuf, IoBufMut};
 use derivative::Derivative;
 use smoltcp::iface::SocketHandle;
 
 use super::TypedSocketHandle;
 
-pub type RecvResult = (io::Result<(usize, SocketAddr)>, Vec<u8>);
+pub type RecvResult = (
+    io::Result<(usize, SocketAddr)>,
+    Box<dyn IoBufMut + Send + 'static>,
+);
 
 #[derive(Derivative)]
 #[derivative(Debug)]
@@ -16,21 +20,21 @@ pub enum OperationEvent {
     Read {
         handle: SocketHandle,
         #[derivative(Debug = "ignore")]
-        buffer: Vec<u8>,
-        result_tx: flume::Sender<(io::Result<usize>, Vec<u8>)>,
+        buffer: Box<dyn IoBufMut + Send + 'static>,
+        result_tx: flume::Sender<(io::Result<usize>, Box<dyn IoBufMut + Send + 'static>)>,
     },
 
     Write {
         handle: SocketHandle,
         #[derivative(Debug = "ignore")]
-        buffer: Vec<u8>,
-        result_tx: flume::Sender<(io::Result<usize>, Vec<u8>)>,
+        buffer: Box<dyn IoBuf + Send + 'static>,
+        result_tx: flume::Sender<(io::Result<usize>, Box<dyn IoBuf + Send + 'static>)>,
     },
 
     Recv {
         handle: SocketHandle,
         #[derivative(Debug = "ignore")]
-        buffer: Vec<u8>,
+        buffer: Box<dyn IoBufMut + Send + 'static>,
         result_tx: flume::Sender<RecvResult>,
     },
 
@@ -38,8 +42,8 @@ pub enum OperationEvent {
         handle: SocketHandle,
         src: SocketAddr,
         #[derivative(Debug = "ignore")]
-        buffer: Vec<u8>,
-        result_tx: flume::Sender<(io::Result<usize>, Vec<u8>)>,
+        buffer: Box<dyn IoBuf + Send>,
+        result_tx: flume::Sender<(io::Result<usize>, Box<dyn IoBuf + Send + 'static>)>,
     },
 
     Shutdown {

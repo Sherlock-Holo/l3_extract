@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Wake, Waker};
 
-pub fn wake_once_fn<F: FnOnce() + Send + Sync + 'static>(f: F) -> Waker {
+pub fn wake_once_fn<F: FnOnce() + Send + 'static>(f: F) -> Waker {
     Waker::from(Arc::new(WakeOnceFn {
         f: AtomicOption {
             used: Default::default(),

@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
+use compio_buf::{IoBuf, IoBufMut};
 use crossbeam_channel::SendError;
 use derivative::Derivative;
 use flume::r#async::RecvStream;
@@ -13,7 +14,7 @@ use futures_util::{Stream, StreamExt};
 use smoltcp::iface::SocketHandle;
 
 use super::event::OperationEvent;
-use super::{TcpInfo, TypedSocketHandle};
+use super::{cast_dyn_io_buf, cast_dyn_io_buf_mut, TcpInfo, TypedSocketHandle};
 use crate::notify_channel::NotifySender;
 
 /// A TCP stream, like tokio/async-net TcpStream
@@ -40,14 +41,18 @@ impl TcpStream {
         self.remote_addr
     }
 
-    /// Pull some bytes from this [`TcpStream`] into the specified buffer, returning how many bytes were read and the buffer itself.
-    pub async fn read(&self, buf: Vec<u8>) -> (io::Result<usize>, Option<Vec<u8>>) {
+    /// Pull some bytes from this [`TcpStream`] into the specified buffer, returning how many bytes
+    /// were read and the buffer itself.
+    pub async fn read<T: IoBufMut + Send + 'static>(
+        &self,
+        buf: T,
+    ) -> (io::Result<usize>, Option<T>) {
         self.read_part.read(buf, self.handle).await
     }
 
     /// Write a buffer into this [`TcpStream`], returning how many bytes were written and buffer
     /// itself.
-    pub async fn write(&self, buf: Vec<u8>) -> (io::Result<usize>, Option<Vec<u8>>) {
+    pub async fn write<T: IoBuf + Send + 'static>(&self, buf: T) -> (io::Result<usize>, Option<T>) {
         self.write_part.write(buf, self.handle).await
     }
 
@@ -72,23 +77,26 @@ struct WritePart {
 }
 
 impl WritePart {
-    async fn write(
+    async fn write<T: IoBuf + Send + 'static>(
         &self,
-        buf: Vec<u8>,
+        buf: T,
         handle: SocketHandle,
-    ) -> (io::Result<usize>, Option<Vec<u8>>) {
-        if buf.is_empty() {
+    ) -> (io::Result<usize>, Option<T>) {
+        if buf.buf_len() == 0 {
             return (Ok(0), Some(buf));
         }
 
         let (tx, rx) = flume::bounded(1);
         if let Err(SendError(event)) = self.operation_event_tx.send(OperationEvent::Write {
             handle,
-            buffer: buf,
+            buffer: Box::new(buf),
             result_tx: tx,
         }) {
             match event {
                 OperationEvent::Write { buffer, .. } => {
+                    // Safety: type is correct
+                    let buffer = unsafe { cast_dyn_io_buf(buffer) };
+
                     return (
                         Err(io::Error::new(
                             ErrorKind::BrokenPipe,
@@ -111,7 +119,12 @@ impl WritePart {
                 None,
             ),
 
-            Ok((res, buf)) => (res, Some(buf)),
+            Ok((res, buf)) => {
+                // Safety: type is correct
+                let buf = unsafe { cast_dyn_io_buf(buf) };
+
+                (res, Some(buf))
+            }
         }
     }
 
@@ -150,23 +163,26 @@ struct ReadPart {
 }
 
 impl ReadPart {
-    async fn read(
+    async fn read<T: IoBufMut + Send + 'static>(
         &self,
-        buf: Vec<u8>,
+        buf: T,
         handle: SocketHandle,
-    ) -> (io::Result<usize>, Option<Vec<u8>>) {
-        if buf.is_empty() {
+    ) -> (io::Result<usize>, Option<T>) {
+        if buf.buf_capacity() - buf.buf_len() == 0 {
             return (Ok(0), Some(buf));
         }
 
         let (tx, rx) = flume::bounded(1);
         if let Err(SendError(event)) = self.operation_event_tx.send(OperationEvent::Read {
             handle,
-            buffer: buf,
+            buffer: Box::new(buf),
             result_tx: tx,
         }) {
             match event {
                 OperationEvent::Read { buffer, .. } => {
+                    // Safety: type is correct
+                    let buffer = unsafe { cast_dyn_io_buf_mut(buffer) };
+
                     return (
                         Err(io::Error::new(
                             ErrorKind::BrokenPipe,
@@ -189,7 +205,12 @@ impl ReadPart {
                 None,
             ),
 
-            Ok((res, buf)) => (res, Some(buf)),
+            Ok((res, buf)) => {
+                // Safety: type is correct
+                let buf = unsafe { cast_dyn_io_buf_mut(buf) };
+
+                (res, Some(buf))
+            }
         }
     }
 }

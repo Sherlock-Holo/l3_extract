@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
+use compio_buf::{IoBuf, IoBufMut};
 use crossbeam_channel::SendError;
 use derivative::Derivative;
 use flume::r#async::RecvStream;
@@ -13,7 +14,7 @@ use futures_util::{Stream, StreamExt};
 use smoltcp::iface::SocketHandle;
 
 use super::event::OperationEvent;
-use super::{TypedSocketHandle, UdpInfo};
+use super::{cast_dyn_io_buf, cast_dyn_io_buf_mut, TypedSocketHandle, UdpInfo};
 use crate::notify_channel::NotifySender;
 
 /// A UDP socket, like tokio/async-net UdpSocket
@@ -34,15 +35,21 @@ impl UdpSocket {
     }
 
     /// Receives a single datagram message on the [`UdpSocket`]
-    pub async fn recv(&self, buf: Vec<u8>) -> (io::Result<(usize, SocketAddr)>, Option<Vec<u8>>) {
+    pub async fn recv<T: IoBufMut + Send + 'static>(
+        &self,
+        buf: T,
+    ) -> (io::Result<(usize, SocketAddr)>, Option<T>) {
         let (tx, rx) = flume::bounded(1);
         if let Err(SendError(event)) = self.operation_event_tx.send(OperationEvent::Recv {
             handle: self.handle,
-            buffer: buf,
+            buffer: Box::new(buf),
             result_tx: tx,
         }) {
             match event {
-                OperationEvent::Read { buffer, .. } => {
+                OperationEvent::Recv { buffer, .. } => {
+                    // Safety: type is correct
+                    let buffer = unsafe { cast_dyn_io_buf_mut(buffer) };
+
                     return (
                         Err(io::Error::new(
                             ErrorKind::BrokenPipe,
@@ -65,25 +72,33 @@ impl UdpSocket {
                 None,
             ),
 
-            Ok((res, buf)) => (res, Some(buf)),
+            Ok((res, buf)) => {
+                // Safety: type is correct
+                let buf = unsafe { cast_dyn_io_buf_mut(buf) };
+
+                (res, Some(buf))
+            }
         }
     }
 
     /// Sends data on the [`UdpSocket`]
-    pub async fn send(
+    pub async fn send<T: IoBuf + Send + 'static>(
         &self,
         buf: Vec<u8>,
         addr: SocketAddr,
-    ) -> (io::Result<usize>, Option<Vec<u8>>) {
+    ) -> (io::Result<usize>, Option<T>) {
         let (tx, rx) = flume::bounded(1);
         if let Err(SendError(event)) = self.operation_event_tx.send(OperationEvent::Send {
             handle: self.handle,
             src: addr,
-            buffer: buf,
+            buffer: Box::new(buf),
             result_tx: tx,
         }) {
             match event {
-                OperationEvent::Write { buffer, .. } => {
+                OperationEvent::Send { buffer, .. } => {
+                    // Safety: type is correct
+                    let buffer = unsafe { cast_dyn_io_buf(buffer) };
+
                     return (
                         Err(io::Error::new(
                             ErrorKind::BrokenPipe,
@@ -106,7 +121,12 @@ impl UdpSocket {
                 None,
             ),
 
-            Ok((res, buf)) => (res, Some(buf)),
+            Ok((res, buf)) => {
+                // Safety: type is correct
+                let buf = unsafe { cast_dyn_io_buf(buf) };
+
+                (res, Some(buf))
+            }
         }
     }
 }

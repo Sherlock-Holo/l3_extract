@@ -19,9 +19,9 @@ checksum = "f26201604c87b1e01bd3d98f8d5d9a8fcbb815e8cedb41ffccbeb4bf593a35fe"
 
 [[package]]
 name = "anyhow"
-version = "1.0.82"
+version = "1.0.83"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f538837af36e6f6a9be0faa67f9a314f8119e4e4b5867c6ab40ed60360142519"
+checksum = "25bdb32cbbdce2b519a9cd7df3a678443100e265d5e25ca763b7572a5104f5f3"
 
 [[package]]
 name = "async-channel"
@@ -236,6 +236,15 @@ name = "cfg-if"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
+
+[[package]]
+name = "compio-buf"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24d9ae28226834dc0f8cd9af2a129488528bcaa4426baaba16072e13cff8440b"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "concurrent-queue"
@@ -588,6 +597,7 @@ dependencies = [
  "async-io 2.3.2",
  "async-net",
  "bytes",
+ "compio-buf",
  "crossbeam-channel",
  "derivative",
  "event-listener 5.3.0",
