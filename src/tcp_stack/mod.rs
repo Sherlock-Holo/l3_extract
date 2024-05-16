@@ -22,16 +22,16 @@ use smoltcp::wire::{
 };
 use tracing::{debug, error, instrument};
 
+use self::event::OperationEvent;
 use self::tcp::TcpAcceptor;
 use self::udp::UdpAcceptor;
-use self::wake_event::OperationEvent;
 use crate::notify_channel::{self, NotifyReceiver, NotifySender};
 use crate::virtual_interface::VirtualInterface;
 use crate::wake_fn::wake_once_fn;
 
+mod event;
 pub mod tcp;
 pub mod udp;
-mod wake_event;
 
 const SOCKET_BUF_SIZE: usize = 16 * 1024;
 const MTU: usize = 1500;
@@ -39,18 +39,14 @@ const MTU: usize = 1500;
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Hash)]
 pub(crate) enum TypedSocketHandle {
     Tcp(SocketHandle),
-    Udp {
-        handle: SocketHandle,
-        src: SocketAddr,
-        dst: SocketAddr,
-    },
+    Udp(SocketHandle),
 }
 
 impl From<TypedSocketHandle> for SocketHandle {
     fn from(value: TypedSocketHandle) -> Self {
         match value {
             TypedSocketHandle::Tcp(handle) => handle,
-            TypedSocketHandle::Udp { handle, .. } => handle,
+            TypedSocketHandle::Udp(handle) => handle,
         }
     }
 }
@@ -65,7 +61,6 @@ pub(crate) struct TcpInfo {
 #[derive(Debug)]
 pub(crate) struct UdpInfo {
     handle: SocketHandle,
-    local_addr: SocketAddr,
     remote_addr: SocketAddr,
 }
 
@@ -157,7 +152,7 @@ pub struct TcpStack<C> {
 
     socket_set: SocketSet<'static>,
     socket_handles: HashSet<TypedSocketHandle>,
-    connected_udp_sockets: HashSet<(SocketAddr, SocketAddr)>,
+    accepted_udp_sockets: HashSet<SocketAddr>,
 
     operation_event_tx: NotifySender<OperationEvent>,
     operation_event_rx: NotifyReceiver<OperationEvent>,
@@ -249,7 +244,7 @@ impl<C> TcpStack<C> {
             virtual_iface,
             socket_set: SocketSet::new(vec![]),
             socket_handles: Default::default(),
-            connected_udp_sockets: Default::default(),
+            accepted_udp_sockets: Default::default(),
             operation_event_tx,
             operation_event_rx,
             tcp_stream_tx,
@@ -291,22 +286,19 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
         let mut udp_events = vec![];
         for event in events {
             match &event {
-                OperationEvent::Read { handle, .. } => match handle {
-                    TypedSocketHandle::Tcp(_) => {
-                        tcp_events.push(event);
-                    }
-                    TypedSocketHandle::Udp { .. } => {
-                        udp_events.push(event);
-                    }
-                },
-                OperationEvent::Write { handle, .. } => match handle {
-                    TypedSocketHandle::Tcp(_) => {
-                        tcp_events.push(event);
-                    }
-                    TypedSocketHandle::Udp { .. } => {
-                        udp_events.push(event);
-                    }
-                },
+                OperationEvent::Read { .. } => {
+                    tcp_events.push(event);
+                }
+                OperationEvent::Write { .. } => {
+                    tcp_events.push(event);
+                }
+
+                OperationEvent::Recv { .. } => {
+                    udp_events.push(event);
+                }
+                OperationEvent::Send { .. } => {
+                    udp_events.push(event);
+                }
 
                 OperationEvent::Ready(typed_handle) => {
                     self.handle_ready_wake_event(*typed_handle);
@@ -406,11 +398,16 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                     socket.register_recv_waker(&waker);
                 }
 
-                TypedSocketHandle::Udp { handle, src, dst } => {
+                TypedSocketHandle::Udp(handle) => {
                     let socket = self.socket_set.get_mut::<UdpSocket>(handle);
+                    let addr = socket.endpoint();
+                    let addr = SocketAddr::new(
+                        addr.addr.expect("udp should always bind an addr").into(),
+                        addr.port,
+                    );
                     socket.close();
 
-                    self.remove_udp_socket(handle, src, dst);
+                    self.remove_udp_socket(handle, addr);
 
                     debug!("close udp socket write done");
                 }
@@ -455,11 +452,17 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                 }));
             }
 
-            TypedSocketHandle::Udp { handle, src, dst } => {
+            TypedSocketHandle::Udp(handle) => {
+                let socket = self.socket_set.get_mut::<UdpSocket>(handle);
+                let addr = socket.endpoint();
+                let addr = SocketAddr::new(
+                    addr.addr.expect("udp should always bind an addr").into(),
+                    addr.port,
+                );
+
                 let _ = self.udp_stream_tx.send(Ok(UdpInfo {
                     handle,
-                    local_addr: src,
-                    remote_addr: dst,
+                    remote_addr: addr,
                 }));
             }
         }
@@ -480,7 +483,10 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                 buffer,
                 result_tx,
             } => {
-                if !self.socket_handles.contains(&handle) {
+                if !self
+                    .socket_handles
+                    .contains(&TypedSocketHandle::Tcp(handle))
+                {
                     error!("tcp socket not found");
 
                     let _ = result_tx.send((Err(io::Error::from(ErrorKind::NotFound)), buffer));
@@ -488,7 +494,7 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                     return;
                 }
 
-                let socket = self.socket_set.get_mut::<TcpSocket>(handle.into());
+                let socket = self.socket_set.get_mut::<TcpSocket>(handle);
                 if !socket.can_send() {
                     if !socket.may_send() {
                         let _ = result_tx.send((
@@ -547,7 +553,10 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                 mut buffer,
                 result_tx,
             } => {
-                if !self.socket_handles.contains(&handle) {
+                if !self
+                    .socket_handles
+                    .contains(&TypedSocketHandle::Tcp(handle))
+                {
                     error!("tcp socket not found");
 
                     let _ = result_tx.send((Err(io::Error::from(ErrorKind::NotFound)), buffer));
@@ -555,7 +564,7 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                     return;
                 }
 
-                let socket = self.socket_set.get_mut::<TcpSocket>(handle.into());
+                let socket = self.socket_set.get_mut::<TcpSocket>(handle);
                 if !socket.can_recv() {
                     if !socket.may_recv() {
                         let _ = result_tx.send((
@@ -613,7 +622,9 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                 }
             }
 
-            OperationEvent::Ready(_)
+            OperationEvent::Recv { .. }
+            | OperationEvent::Send { .. }
+            | OperationEvent::Ready(_)
             | OperationEvent::Shutdown { .. }
             | OperationEvent::Close(_) => unreachable!(),
         }
@@ -629,12 +640,16 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
     #[instrument(level = "debug", skip(self))]
     fn handle_udp_wake_event(&mut self, event: OperationEvent) {
         match event {
-            OperationEvent::Write {
+            OperationEvent::Send {
                 handle,
+                src,
                 buffer,
                 result_tx,
             } => {
-                if !self.socket_handles.contains(&handle) {
+                if !self
+                    .socket_handles
+                    .contains(&TypedSocketHandle::Udp(handle))
+                {
                     error!("udp socket not found");
 
                     let _ = result_tx.send((Err(io::Error::from(ErrorKind::NotFound)), buffer));
@@ -642,7 +657,7 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                     return;
                 }
 
-                let socket = self.socket_set.get_mut::<UdpSocket>(handle.into());
+                let socket = self.socket_set.get_mut::<UdpSocket>(handle);
                 if !socket.can_send() {
                     let tx = self.operation_event_tx.clone();
                     socket.register_send_waker(&wake_once_fn(move || {
@@ -672,11 +687,6 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                     return;
                 }
 
-                let src = match handle {
-                    TypedSocketHandle::Udp { src, .. } => src,
-                    _ => unreachable!(),
-                };
-
                 match socket.send_slice(&buffer, src) {
                     Err(err) => {
                         error!(?err, "send data failed");
@@ -691,12 +701,15 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                 }
             }
 
-            OperationEvent::Read {
+            OperationEvent::Recv {
                 handle,
                 mut buffer,
                 result_tx,
             } => {
-                if !self.socket_handles.contains(&handle) {
+                if !self
+                    .socket_handles
+                    .contains(&TypedSocketHandle::Udp(handle))
+                {
                     error!("udp socket not found");
 
                     let _ = result_tx.send((Err(io::Error::from(ErrorKind::NotFound)), buffer));
@@ -704,11 +717,11 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                     return;
                 }
 
-                let socket = self.socket_set.get_mut::<UdpSocket>(handle.into());
+                let socket = self.socket_set.get_mut::<UdpSocket>(handle);
                 if !socket.can_recv() {
                     let tx = self.operation_event_tx.clone();
                     socket.register_recv_waker(&wake_once_fn(move || {
-                        if let Err(SendError(event)) = tx.send(OperationEvent::Read {
+                        if let Err(SendError(event)) = tx.send(OperationEvent::Recv {
                             handle,
                             buffer,
                             result_tx,
@@ -740,13 +753,17 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                             result_tx.send((Err(io::Error::new(ErrorKind::Other, err)), buffer));
                     }
 
-                    Ok((n, _)) => {
-                        let _ = result_tx.send((Ok(n), buffer));
+                    Ok((n, metadata)) => {
+                        let addr =
+                            SocketAddr::new(metadata.endpoint.addr.into(), metadata.endpoint.port);
+                        let _ = result_tx.send((Ok((n, addr)), buffer));
                     }
                 }
             }
 
-            OperationEvent::Ready(_)
+            OperationEvent::Write { .. }
+            | OperationEvent::Read { .. }
+            | OperationEvent::Ready(_)
             | OperationEvent::Shutdown { .. }
             | OperationEvent::Close(_) => unreachable!(),
         }
@@ -759,11 +776,10 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
     }
 
     #[instrument(level = "debug", skip(self))]
-    fn remove_udp_socket(&mut self, handle: SocketHandle, src: SocketAddr, dst: SocketAddr) {
+    fn remove_udp_socket(&mut self, handle: SocketHandle, dst: SocketAddr) {
         self.socket_set.remove(handle);
-        self.connected_udp_sockets.remove(&(src, dst));
-        self.socket_handles
-            .remove(&TypedSocketHandle::Udp { handle, src, dst });
+        self.accepted_udp_sockets.remove(&dst);
+        self.socket_handles.remove(&TypedSocketHandle::Udp(handle));
     }
 
     #[instrument(level = "debug", skip(self), err(Debug))]
@@ -785,9 +801,9 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                     PacketType::Udp { src, dst } => {
                         debug!(%src, %dst, "get udp packet");
 
-                        self.try_init_udp(src, dst)?;
-
-                        debug!(%src, %dst, "try init udp done");
+                        if self.try_init_udp(dst)? {
+                            debug!(%src, %dst, "try init udp done");
+                        }
                     }
                 }
             }
@@ -819,24 +835,24 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
     }
 
     #[instrument(level = "debug", skip(self), err(Debug))]
-    fn try_init_udp(&mut self, src: SocketAddr, dst: SocketAddr) -> anyhow::Result<()> {
-        if self.connected_udp_sockets.contains(&(src, dst)) {
+    fn try_init_udp(&mut self, dst: SocketAddr) -> anyhow::Result<bool> {
+        if self.accepted_udp_sockets.contains(&dst) {
             debug!("ignore connected udp");
 
-            return Ok(());
+            return Ok(false);
         }
 
         let mut socket = create_udp_socket(SOCKET_BUF_SIZE);
         socket.bind(dst).with_context(|| "udp socket bind failed")?;
         let handle = self.socket_set.add(socket);
-        let typed_handle = TypedSocketHandle::Udp { handle, src, dst };
+        let typed_handle = TypedSocketHandle::Udp(handle);
         self.socket_handles.insert(typed_handle);
-        self.connected_udp_sockets.insert((src, dst));
+        self.accepted_udp_sockets.insert(dst);
 
         self.operation_event_tx
             .send(OperationEvent::Ready(typed_handle))?;
 
-        Ok(())
+        Ok(true)
     }
 
     #[instrument(level = "debug", skip(self), err(Debug))]

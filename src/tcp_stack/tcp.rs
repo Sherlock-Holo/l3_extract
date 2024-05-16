@@ -12,7 +12,7 @@ use flume::r#async::RecvStream;
 use futures_util::{Stream, StreamExt};
 use smoltcp::iface::SocketHandle;
 
-use super::wake_event::OperationEvent;
+use super::event::OperationEvent;
 use super::{TcpInfo, TypedSocketHandle};
 use crate::notify_channel::NotifySender;
 
@@ -20,10 +20,6 @@ use crate::notify_channel::NotifySender;
 ///
 /// This TCP stream doesn't like normal [`std::net::TcpStream`] which accepted by
 /// [`std::net::TcpListener`], it is a **client** side TCP stream
-///
-/// ## Notes
-///
-/// You must call [flush](futures_util::AsyncWriteExt::flush) to make sure data is written to peer
 #[derive(Debug)]
 pub struct TcpStream {
     local_addr: SocketAddr,
@@ -44,6 +40,7 @@ impl TcpStream {
         self.remote_addr
     }
 
+    /// Pull some bytes from this [`TcpStream`] into the specified buffer, returning how many bytes were read and the buffer itself.
     pub async fn read(&self, buf: Vec<u8>) -> (io::Result<usize>, Option<Vec<u8>>) {
         self.read_part.read(buf, self.handle).await
     }
@@ -86,7 +83,7 @@ impl WritePart {
 
         let (tx, rx) = flume::bounded(1);
         if let Err(SendError(event)) = self.operation_event_tx.send(OperationEvent::Write {
-            handle: TypedSocketHandle::Tcp(handle),
+            handle,
             buffer: buf,
             result_tx: tx,
         }) {
@@ -164,7 +161,7 @@ impl ReadPart {
 
         let (tx, rx) = flume::bounded(1);
         if let Err(SendError(event)) = self.operation_event_tx.send(OperationEvent::Read {
-            handle: TypedSocketHandle::Tcp(handle),
+            handle,
             buffer: buf,
             result_tx: tx,
         }) {
