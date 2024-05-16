@@ -4,6 +4,7 @@ use std::io;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 
 use compio_buf::{IoBuf, IoBufMut};
@@ -16,6 +17,7 @@ use smoltcp::iface::SocketHandle;
 use super::event::OperationEvent;
 use super::{cast_dyn_io_buf, cast_dyn_io_buf_mut, TypedSocketHandle, UdpInfo};
 use crate::notify_channel::NotifySender;
+use crate::shared_buf::{AsIoBuf, AsIoBufMut, SharedBuf};
 
 /// A UDP socket, like tokio/async-net UdpSocket
 ///
@@ -35,18 +37,22 @@ impl UdpSocket {
     }
 
     /// Receives a single datagram message on the [`UdpSocket`]
-    pub async fn recv<T: IoBufMut + Send + 'static>(
+    pub async fn recv<T: IoBufMut + Send + Sync + 'static>(
         &self,
         buf: T,
-    ) -> (io::Result<(usize, SocketAddr)>, Option<T>) {
+    ) -> (io::Result<(usize, SocketAddr)>, T) {
+        let buf = Arc::new(SharedBuf::new(buf)) as Arc<dyn AsIoBufMut>;
         let (tx, rx) = flume::bounded(1);
         if let Err(SendError(event)) = self.operation_event_tx.send(OperationEvent::Recv {
             handle: self.handle,
-            buffer: Box::new(buf),
+            buffer: buf.clone(),
             result_tx: tx,
         }) {
             match event {
                 OperationEvent::Recv { buffer, .. } => {
+                    // make sure buffer ref count is 1
+                    drop(buf);
+
                     // Safety: type is correct
                     let buffer = unsafe { cast_dyn_io_buf_mut(buffer) };
 
@@ -55,7 +61,7 @@ impl UdpSocket {
                             ErrorKind::BrokenPipe,
                             "TcpStack may be dropped, send read operation event failed",
                         )),
-                        Some(buffer),
+                        buffer,
                     );
                 }
 
@@ -64,38 +70,49 @@ impl UdpSocket {
         }
 
         match rx.recv_async().await {
-            Err(_) => (
-                Err(io::Error::new(
-                    ErrorKind::BrokenPipe,
-                    "TcpStack may be dropped, receive read operation response failed",
-                )),
-                None,
-            ),
+            Err(_) => {
+                // Safety: type is correct, and when recv_async failed, means sender is dropped,
+                // there is only one reason cause it: TcpStack should own the sender, but TcpStack
+                // is dropped
+                let buf = unsafe { cast_dyn_io_buf_mut(buf) };
 
-            Ok((res, buf)) => {
+                (
+                    Err(io::Error::new(
+                        ErrorKind::BrokenPipe,
+                        "TcpStack may be dropped, receive read operation response failed",
+                    )),
+                    buf,
+                )
+            }
+
+            Ok(res) => {
                 // Safety: type is correct
                 let buf = unsafe { cast_dyn_io_buf_mut(buf) };
 
-                (res, Some(buf))
+                (res, buf)
             }
         }
     }
 
     /// Sends data on the [`UdpSocket`]
-    pub async fn send<T: IoBuf + Send + 'static>(
+    pub async fn send<T: IoBuf + Send + Sync + 'static>(
         &self,
         buf: Vec<u8>,
         addr: SocketAddr,
-    ) -> (io::Result<usize>, Option<T>) {
+    ) -> (io::Result<usize>, T) {
+        let buf = Arc::new(SharedBuf::new(buf)) as Arc<dyn AsIoBuf>;
         let (tx, rx) = flume::bounded(1);
         if let Err(SendError(event)) = self.operation_event_tx.send(OperationEvent::Send {
             handle: self.handle,
             src: addr,
-            buffer: Box::new(buf),
+            buffer: buf.clone(),
             result_tx: tx,
         }) {
             match event {
                 OperationEvent::Send { buffer, .. } => {
+                    // make sure buffer ref count is 1
+                    drop(buf);
+
                     // Safety: type is correct
                     let buffer = unsafe { cast_dyn_io_buf(buffer) };
 
@@ -104,7 +121,7 @@ impl UdpSocket {
                             ErrorKind::BrokenPipe,
                             "TcpStack may be dropped, send write operation event failed",
                         )),
-                        Some(buffer),
+                        buffer,
                     );
                 }
 
@@ -113,19 +130,26 @@ impl UdpSocket {
         }
 
         match rx.recv_async().await {
-            Err(_) => (
-                Err(io::Error::new(
-                    ErrorKind::BrokenPipe,
-                    "TcpStack may be dropped, receive write operation response failed",
-                )),
-                None,
-            ),
+            Err(_) => {
+                // Safety: type is correct, and when recv_async failed, means sender is dropped,
+                // there is only one reason cause it: TcpStack should own the sender, but TcpStack
+                // is dropped
+                let buf = unsafe { cast_dyn_io_buf(buf) };
 
-            Ok((res, buf)) => {
+                (
+                    Err(io::Error::new(
+                        ErrorKind::BrokenPipe,
+                        "TcpStack may be dropped, receive write operation response failed",
+                    )),
+                    buf,
+                )
+            }
+
+            Ok(res) => {
                 // Safety: type is correct
                 let buf = unsafe { cast_dyn_io_buf(buf) };
 
-                (res, Some(buf))
+                (res, buf)
             }
         }
     }

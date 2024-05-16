@@ -1,13 +1,14 @@
 //! TCP network stack
 
 use std::collections::HashSet;
+use std::io;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::sync::Arc;
 use std::time::Duration;
-use std::{io, slice};
 
 use anyhow::Context as _;
-use compio_buf::{IoBuf, IoBufMut, SetBufInit};
+use compio_buf::{IoBuf, IoBufMut};
 use crossbeam_channel::SendError;
 use flume::Sender;
 use futures_timer::Delay;
@@ -27,6 +28,7 @@ use self::event::OperationEvent;
 use self::tcp::TcpAcceptor;
 use self::udp::UdpAcceptor;
 use crate::notify_channel::{self, NotifyReceiver, NotifySender};
+use crate::shared_buf::{AsIoBuf, AsIoBufMut, SharedBuf};
 use crate::virtual_interface::VirtualInterface;
 use crate::wake_fn::wake_once_fn;
 
@@ -490,7 +492,8 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                 {
                     error!("tcp socket not found");
 
-                    let _ = result_tx.send((Err(io::Error::from(ErrorKind::NotFound)), buffer));
+                    drop(buffer);
+                    let _ = result_tx.send(Err(io::Error::from(ErrorKind::NotFound)));
 
                     return;
                 }
@@ -498,13 +501,11 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                 let socket = self.socket_set.get_mut::<TcpSocket>(handle);
                 if !socket.can_send() {
                     if !socket.may_send() {
-                        let _ = result_tx.send((
-                            Err(io::Error::new(
-                                ErrorKind::BrokenPipe,
-                                format!("TCP send failed, socket state: {}", socket.state()),
-                            )),
-                            buffer,
-                        ));
+                        drop(buffer);
+                        let _ = result_tx.send(Err(io::Error::new(
+                            ErrorKind::BrokenPipe,
+                            format!("TCP send failed, socket state: {}", socket.state()),
+                        )));
                     } else {
                         let tx = self.operation_event_tx.clone();
                         socket.register_send_waker(&wake_once_fn(move || {
@@ -517,13 +518,12 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                                     OperationEvent::Write {
                                         buffer, result_tx, ..
                                     } => {
-                                        let _ = result_tx.send((
-                                            Err(io::Error::new(
-                                                ErrorKind::BrokenPipe,
-                                                "wake TCP write failed",
-                                            )),
-                                            buffer,
-                                        ));
+                                        drop(buffer);
+
+                                        let _ = result_tx.send(Err(io::Error::new(
+                                            ErrorKind::BrokenPipe,
+                                            "wake TCP write failed",
+                                        )));
                                     }
 
                                     _ => unreachable!(),
@@ -535,23 +535,28 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                     return;
                 }
 
-                match socket.send_slice(buffer.as_slice()) {
-                    Err(err) => {
-                        error!(?err, "send data failed");
+                // Safety: when doing this operation, the other buffer is owned by future returned
+                // by TcpStream::read, now the future is either blocked or dropped, no one access it
+                unsafe {
+                    match socket.send_slice(buffer.as_slice()) {
+                        Err(err) => {
+                            error!(?err, "send data failed");
 
-                        let _ =
-                            result_tx.send((Err(io::Error::new(ErrorKind::Other, err)), buffer));
-                    }
+                            drop(buffer);
+                            let _ = result_tx.send(Err(io::Error::new(ErrorKind::Other, err)));
+                        }
 
-                    Ok(n) => {
-                        let _ = result_tx.send((Ok(n), buffer));
+                        Ok(n) => {
+                            drop(buffer);
+                            let _ = result_tx.send(Ok(n));
+                        }
                     }
                 }
             }
 
             OperationEvent::Read {
                 handle,
-                mut buffer,
+                buffer,
                 result_tx,
             } => {
                 if !self
@@ -560,7 +565,8 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                 {
                     error!("tcp socket not found");
 
-                    let _ = result_tx.send((Err(io::Error::from(ErrorKind::NotFound)), buffer));
+                    drop(buffer);
+                    let _ = result_tx.send(Err(io::Error::from(ErrorKind::NotFound)));
 
                     return;
                 }
@@ -568,13 +574,12 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                 let socket = self.socket_set.get_mut::<TcpSocket>(handle);
                 if !socket.can_recv() {
                     if !socket.may_recv() {
-                        let _ = result_tx.send((
-                            Err(io::Error::new(
-                                ErrorKind::BrokenPipe,
-                                format!("TCP recv failed, socket state: {}", socket.state()),
-                            )),
-                            buffer,
-                        ));
+                        drop(buffer);
+
+                        let _ = result_tx.send(Err(io::Error::new(
+                            ErrorKind::BrokenPipe,
+                            format!("TCP recv failed, socket state: {}", socket.state()),
+                        )));
                     } else {
                         let tx = self.operation_event_tx.clone();
                         socket.register_recv_waker(&wake_once_fn(move || {
@@ -587,13 +592,11 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                                     OperationEvent::Read {
                                         buffer, result_tx, ..
                                     } => {
-                                        let _ = result_tx.send((
-                                            Err(io::Error::new(
-                                                ErrorKind::BrokenPipe,
-                                                "wake TCP read failed",
-                                            )),
-                                            buffer,
-                                        ));
+                                        drop(buffer);
+                                        let _ = result_tx.send(Err(io::Error::new(
+                                            ErrorKind::BrokenPipe,
+                                            "wake TCP read failed",
+                                        )));
                                     }
 
                                     _ => unreachable!(),
@@ -605,27 +608,29 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                     return;
                 }
 
-                // Safety: we won't read the uninitiated buffer and set the correct new len
+                // Safety: when doing this operation, the other buffer is owned by future returned
+                // by TcpStream::read, now the future is either blocked or dropped, no one access it
                 unsafe {
-                    let uninitiated_buffer =
-                        slice::from_raw_parts_mut(buffer.as_buf_mut_ptr(), buffer.buf_capacity());
-                    let res = socket.recv_slice(uninitiated_buffer);
+                    let res = socket.recv_slice(buffer.as_slice_mut());
                     match res {
                         Err(RecvError::Finished) => {
+                            drop(buffer);
+
                             // when tcp read eof, still return the buffer
-                            let _ = result_tx.send((Ok(0), buffer));
+                            let _ = result_tx.send(Ok(0));
                         }
 
                         Err(err) => {
-                            let _ = result_tx
-                                .send((Err(io::Error::new(ErrorKind::Other, err)), buffer));
+                            drop(buffer);
+                            let _ = result_tx.send(Err(io::Error::new(ErrorKind::Other, err)));
                         }
 
                         Ok(n) => {
-                            let new_len = buffer.buf_len() + n;
-                            buffer.set_buf_init(new_len);
+                            let new_len = buffer.initiated_len() + n;
+                            buffer.set_initiated_len(new_len);
 
-                            let _ = result_tx.send((Ok(n), buffer));
+                            drop(buffer);
+                            let _ = result_tx.send(Ok(n));
                         }
                     }
                 }
@@ -661,7 +666,8 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                 {
                     error!("udp socket not found");
 
-                    let _ = result_tx.send((Err(io::Error::from(ErrorKind::NotFound)), buffer));
+                    drop(buffer);
+                    let _ = result_tx.send(Err(io::Error::from(ErrorKind::NotFound)));
 
                     return;
                 }
@@ -680,13 +686,11 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                                 OperationEvent::Send {
                                     buffer, result_tx, ..
                                 } => {
-                                    let _ = result_tx.send((
-                                        Err(io::Error::new(
-                                            ErrorKind::BrokenPipe,
-                                            "wake UDP write failed",
-                                        )),
-                                        buffer,
-                                    ));
+                                    drop(buffer);
+                                    let _ = result_tx.send(Err(io::Error::new(
+                                        ErrorKind::BrokenPipe,
+                                        "wake UDP write failed",
+                                    )));
                                 }
 
                                 _ => unreachable!(),
@@ -697,23 +701,29 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                     return;
                 }
 
-                match socket.send_slice(buffer.as_slice(), src) {
-                    Err(err) => {
-                        error!(?err, "send data failed");
+                // Safety: when doing this operation, the other buffer is owned by future returned
+                // by UdpSocket::recv, now the future is either blocked or dropped, no one access it
+                unsafe {
+                    match socket.send_slice(buffer.as_slice(), src) {
+                        Err(err) => {
+                            error!(?err, "send data failed");
 
-                        let _ =
-                            result_tx.send((Err(io::Error::new(ErrorKind::Other, err)), buffer));
-                    }
+                            drop(buffer);
+                            let _ = result_tx.send(Err(io::Error::new(ErrorKind::Other, err)));
+                        }
 
-                    Ok(_) => {
-                        let _ = result_tx.send((Ok(buffer.buf_len()), buffer));
+                        Ok(_) => {
+                            let len = buffer.as_slice().len();
+                            drop(buffer);
+                            let _ = result_tx.send(Ok(len));
+                        }
                     }
                 }
             }
 
             OperationEvent::Recv {
                 handle,
-                mut buffer,
+                buffer,
                 result_tx,
             } => {
                 if !self
@@ -722,7 +732,8 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                 {
                     error!("udp socket not found");
 
-                    let _ = result_tx.send((Err(io::Error::from(ErrorKind::NotFound)), buffer));
+                    drop(buffer);
+                    let _ = result_tx.send(Err(io::Error::from(ErrorKind::NotFound)));
 
                     return;
                 }
@@ -740,13 +751,11 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                                 OperationEvent::Recv {
                                     buffer, result_tx, ..
                                 } => {
-                                    let _ = result_tx.send((
-                                        Err(io::Error::new(
-                                            ErrorKind::BrokenPipe,
-                                            "wake UDP read failed",
-                                        )),
-                                        buffer,
-                                    ));
+                                    drop(buffer);
+                                    let _ = result_tx.send(Err(io::Error::new(
+                                        ErrorKind::BrokenPipe,
+                                        "wake UDP read failed",
+                                    )));
                                 }
 
                                 _ => unreachable!(),
@@ -757,14 +766,13 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                     return;
                 }
 
-                // Safety: we won't read the uninitiated buffer and set the correct new len
+                // Safety: when doing this operation, the other buffer is owned by future returned
+                // by TcpStream::read, now the future is either blocked or dropped, no one access it
                 unsafe {
-                    let uninitiated_buffer =
-                        slice::from_raw_parts_mut(buffer.as_buf_mut_ptr(), buffer.buf_capacity());
-                    match socket.recv_slice(uninitiated_buffer) {
+                    match socket.recv_slice(buffer.as_slice_mut()) {
                         Err(err) => {
-                            let _ = result_tx
-                                .send((Err(io::Error::new(ErrorKind::Other, err)), buffer));
+                            drop(buffer);
+                            let _ = result_tx.send(Err(io::Error::new(ErrorKind::Other, err)));
                         }
 
                         Ok((n, metadata)) => {
@@ -773,10 +781,11 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                                 metadata.endpoint.port,
                             );
 
-                            let new_len = buffer.buf_len() + n;
-                            buffer.set_buf_init(new_len);
+                            let new_len = buffer.initiated_len() + n;
+                            buffer.set_initiated_len(new_len);
+                            drop(buffer);
 
-                            let _ = result_tx.send((Ok((n, addr)), buffer));
+                            let _ = result_tx.send(Ok((n, addr)));
                         }
                     }
                 }
@@ -1077,10 +1086,18 @@ fn ipv6_init_interface(
     Ok(())
 }
 
-unsafe fn cast_dyn_io_buf<T: IoBuf>(buf: Box<dyn IoBuf>) -> T {
-    *Box::from_raw(Box::into_raw(buf).cast())
+unsafe fn cast_dyn_io_buf<T: IoBuf>(buf: Arc<dyn AsIoBuf>) -> T {
+    let buf = Arc::from_raw(Arc::into_raw(buf) as *const SharedBuf<T>);
+
+    Arc::into_inner(buf)
+        .expect("buf reference count not equal 1")
+        .into_inner()
 }
 
-unsafe fn cast_dyn_io_buf_mut<T: IoBufMut>(buf: Box<dyn IoBufMut>) -> T {
-    *Box::from_raw(Box::into_raw(buf).cast())
+unsafe fn cast_dyn_io_buf_mut<T: IoBufMut>(buf: Arc<dyn AsIoBufMut>) -> T {
+    let buf = Arc::from_raw(Arc::into_raw(buf) as *const SharedBuf<T>);
+
+    Arc::into_inner(buf)
+        .expect("buf reference count not equal 1")
+        .into_inner()
 }

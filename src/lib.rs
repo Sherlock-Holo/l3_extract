@@ -10,6 +10,7 @@ pub use tcp_stack::{
 };
 
 mod notify_channel;
+mod shared_buf;
 pub mod tcp_stack;
 mod virtual_interface;
 mod wake_fn;

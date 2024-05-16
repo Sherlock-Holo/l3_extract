@@ -4,6 +4,7 @@ use std::io;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 
 use compio_buf::{IoBuf, IoBufMut};
@@ -16,6 +17,7 @@ use smoltcp::iface::SocketHandle;
 use super::event::OperationEvent;
 use super::{cast_dyn_io_buf, cast_dyn_io_buf_mut, TcpInfo, TypedSocketHandle};
 use crate::notify_channel::NotifySender;
+use crate::shared_buf::{AsIoBuf, AsIoBufMut, SharedBuf};
 
 /// A TCP stream, like tokio/async-net TcpStream
 ///
@@ -26,8 +28,7 @@ pub struct TcpStream {
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
     handle: SocketHandle,
-    read_part: ReadPart,
-    write_part: WritePart,
+    operation_event_tx: NotifySender<OperationEvent>,
 }
 
 impl TcpStream {
@@ -43,66 +44,35 @@ impl TcpStream {
 
     /// Pull some bytes from this [`TcpStream`] into the specified buffer, returning how many bytes
     /// were read and the buffer itself.
-    pub async fn read<T: IoBufMut + Send + 'static>(
+    pub async fn read<T: IoBufMut + Send + Sync + 'static>(
         &self,
         buf: T,
-    ) -> (io::Result<usize>, Option<T>) {
-        self.read_part.read(buf, self.handle).await
-    }
-
-    /// Write a buffer into this [`TcpStream`], returning how many bytes were written and buffer
-    /// itself.
-    pub async fn write<T: IoBuf + Send + 'static>(&self, buf: T) -> (io::Result<usize>, Option<T>) {
-        self.write_part.write(buf, self.handle).await
-    }
-
-    /// Shuts down the write halves of this connection.
-    pub async fn shutdown(&self) -> io::Result<()> {
-        self.write_part.shutdown(self.handle).await
-    }
-}
-
-impl Drop for TcpStream {
-    fn drop(&mut self) {
-        let _ = self
-            .write_part
-            .operation_event_tx
-            .send(OperationEvent::Close(TypedSocketHandle::Tcp(self.handle)));
-    }
-}
-
-#[derive(Debug)]
-struct WritePart {
-    operation_event_tx: NotifySender<OperationEvent>,
-}
-
-impl WritePart {
-    async fn write<T: IoBuf + Send + 'static>(
-        &self,
-        buf: T,
-        handle: SocketHandle,
-    ) -> (io::Result<usize>, Option<T>) {
-        if buf.buf_len() == 0 {
-            return (Ok(0), Some(buf));
+    ) -> (io::Result<usize>, T) {
+        if buf.buf_capacity() - buf.buf_len() == 0 {
+            return (Ok(0), buf);
         }
 
+        let buf = Arc::new(SharedBuf::new(buf)) as Arc<dyn AsIoBufMut>;
         let (tx, rx) = flume::bounded(1);
-        if let Err(SendError(event)) = self.operation_event_tx.send(OperationEvent::Write {
-            handle,
-            buffer: Box::new(buf),
+        if let Err(SendError(event)) = self.operation_event_tx.send(OperationEvent::Read {
+            handle: self.handle,
+            buffer: buf.clone(),
             result_tx: tx,
         }) {
             match event {
-                OperationEvent::Write { buffer, .. } => {
+                OperationEvent::Read { buffer, .. } => {
+                    // make sure buffer ref count is 1
+                    drop(buf);
+
                     // Safety: type is correct
-                    let buffer = unsafe { cast_dyn_io_buf(buffer) };
+                    let buffer = unsafe { cast_dyn_io_buf_mut(buffer) };
 
                     return (
                         Err(io::Error::new(
                             ErrorKind::BrokenPipe,
-                            "TcpStack may be dropped, send write operation event failed",
+                            "TcpStack may be dropped, send read operation event failed",
                         )),
-                        Some(buffer),
+                        buffer,
                     );
                 }
 
@@ -111,27 +81,95 @@ impl WritePart {
         }
 
         match rx.recv_async().await {
-            Err(_) => (
-                Err(io::Error::new(
-                    ErrorKind::BrokenPipe,
-                    "TcpStack may be dropped, receive write operation response failed",
-                )),
-                None,
-            ),
+            Err(_) => {
+                // Safety: type is correct, and when recv_async failed, means sender is dropped,
+                // there is only one reason cause it: TcpStack should own the sender, but TcpStack
+                // is dropped
+                let buf = unsafe { cast_dyn_io_buf_mut(buf) };
 
-            Ok((res, buf)) => {
+                (
+                    Err(io::Error::new(
+                        ErrorKind::BrokenPipe,
+                        "TcpStack may be dropped, receive read operation response failed",
+                    )),
+                    buf,
+                )
+            }
+
+            Ok(res) => {
                 // Safety: type is correct
-                let buf = unsafe { cast_dyn_io_buf(buf) };
+                let buf = unsafe { cast_dyn_io_buf_mut(buf) };
 
-                (res, Some(buf))
+                (res, buf)
             }
         }
     }
 
-    async fn shutdown(&self, handle: SocketHandle) -> io::Result<()> {
+    /// Write a buffer into this [`TcpStream`], returning how many bytes were written and buffer
+    /// itself.
+    pub async fn write<T: IoBuf + Send + Sync + 'static>(&self, buf: T) -> (io::Result<usize>, T) {
+        if buf.buf_len() == 0 {
+            return (Ok(0), buf);
+        }
+
+        let buf = Arc::new(SharedBuf::new(buf)) as Arc<dyn AsIoBuf>;
+        let (tx, rx) = flume::bounded(1);
+        if let Err(SendError(event)) = self.operation_event_tx.send(OperationEvent::Write {
+            handle: self.handle,
+            buffer: buf.clone(),
+            result_tx: tx,
+        }) {
+            match event {
+                OperationEvent::Write { buffer, .. } => {
+                    // make sure buffer ref count is 1
+                    drop(buf);
+
+                    // Safety: type is correct
+                    let buffer = unsafe { cast_dyn_io_buf(buffer) };
+
+                    return (
+                        Err(io::Error::new(
+                            ErrorKind::BrokenPipe,
+                            "TcpStack may be dropped, send write operation event failed",
+                        )),
+                        buffer,
+                    );
+                }
+
+                _ => unreachable!(),
+            }
+        }
+
+        match rx.recv_async().await {
+            Err(_) => {
+                // Safety: type is correct, and when recv_async failed, means sender is dropped,
+                // there is only one reason cause it: TcpStack should own the sender, but TcpStack
+                // is dropped
+                let buf = unsafe { cast_dyn_io_buf(buf) };
+
+                (
+                    Err(io::Error::new(
+                        ErrorKind::BrokenPipe,
+                        "TcpStack may be dropped, receive write operation response failed",
+                    )),
+                    buf,
+                )
+            }
+
+            Ok(res) => {
+                // Safety: type is correct
+                let buf = unsafe { cast_dyn_io_buf(buf) };
+
+                (res, buf)
+            }
+        }
+    }
+
+    /// Shuts down the write halves of this connection.
+    pub async fn shutdown(&self) -> io::Result<()> {
         let (tx, rx) = flume::bounded(1);
         if let Err(SendError(event)) = self.operation_event_tx.send(OperationEvent::Shutdown {
-            handle: TypedSocketHandle::Tcp(handle),
+            handle: TypedSocketHandle::Tcp(self.handle),
             result_tx: tx,
         }) {
             match event {
@@ -157,61 +195,11 @@ impl WritePart {
     }
 }
 
-#[derive(Debug)]
-struct ReadPart {
-    operation_event_tx: NotifySender<OperationEvent>,
-}
-
-impl ReadPart {
-    async fn read<T: IoBufMut + Send + 'static>(
-        &self,
-        buf: T,
-        handle: SocketHandle,
-    ) -> (io::Result<usize>, Option<T>) {
-        if buf.buf_capacity() - buf.buf_len() == 0 {
-            return (Ok(0), Some(buf));
-        }
-
-        let (tx, rx) = flume::bounded(1);
-        if let Err(SendError(event)) = self.operation_event_tx.send(OperationEvent::Read {
-            handle,
-            buffer: Box::new(buf),
-            result_tx: tx,
-        }) {
-            match event {
-                OperationEvent::Read { buffer, .. } => {
-                    // Safety: type is correct
-                    let buffer = unsafe { cast_dyn_io_buf_mut(buffer) };
-
-                    return (
-                        Err(io::Error::new(
-                            ErrorKind::BrokenPipe,
-                            "TcpStack may be dropped, send read operation event failed",
-                        )),
-                        Some(buffer),
-                    );
-                }
-
-                _ => unreachable!(),
-            }
-        }
-
-        match rx.recv_async().await {
-            Err(_) => (
-                Err(io::Error::new(
-                    ErrorKind::BrokenPipe,
-                    "TcpStack may be dropped, receive read operation response failed",
-                )),
-                None,
-            ),
-
-            Ok((res, buf)) => {
-                // Safety: type is correct
-                let buf = unsafe { cast_dyn_io_buf_mut(buf) };
-
-                (res, Some(buf))
-            }
-        }
+impl Drop for TcpStream {
+    fn drop(&mut self) {
+        let _ = self
+            .operation_event_tx
+            .send(OperationEvent::Close(TypedSocketHandle::Tcp(self.handle)));
     }
 }
 
@@ -236,12 +224,7 @@ impl Stream for TcpAcceptor {
                 local_addr: tcp_info.local_addr,
                 remote_addr: tcp_info.remote_addr,
                 handle: tcp_info.handle,
-                read_part: ReadPart {
-                    operation_event_tx: self.operation_event_tx.clone(),
-                },
-                write_part: WritePart {
-                    operation_event_tx: self.operation_event_tx.clone(),
-                },
+                operation_event_tx: self.operation_event_tx.clone(),
             }))),
         }
     }

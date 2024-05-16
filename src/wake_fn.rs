@@ -15,7 +15,7 @@ pub fn wake_once_fn<F: FnOnce() + Send + 'static>(f: F) -> Waker {
 }
 
 #[derive(Debug)]
-struct WakeOnceFn<F: FnOnce()> {
+struct WakeOnceFn<F> {
     f: AtomicOption<F>,
 }
 
@@ -55,7 +55,8 @@ impl<T> AtomicOption<T> {
     }
 }
 
-unsafe impl<T: Send> Sync for AtomicOption<T> {}
+// Safety: the AtomicBool guarantee only one can access the T
+unsafe impl<T> Sync for AtomicOption<T> {}
 
 impl<T> Drop for AtomicOption<T> {
     fn drop(&mut self) {
