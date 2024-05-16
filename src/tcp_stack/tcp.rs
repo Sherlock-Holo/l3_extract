@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 
-use compio_buf::{IoBuf, IoBufMut};
+use compio_buf::{IntoInner, IoBuf, IoBufMut};
 use crossbeam_channel::SendError;
 use derivative::Derivative;
 use flume::r#async::RecvStream;
@@ -44,10 +44,7 @@ impl TcpStream {
 
     /// Pull some bytes from this [`TcpStream`] into the specified buffer, returning how many bytes
     /// were read and the buffer itself.
-    pub async fn read<T: IoBufMut + Send + Sync + 'static>(
-        &self,
-        buf: T,
-    ) -> (io::Result<usize>, T) {
+    pub async fn read<T: IoBufMut + Send + Sync>(&self, buf: T) -> (io::Result<usize>, T) {
         if buf.buf_capacity() - buf.buf_len() == 0 {
             return (Ok(0), buf);
         }
@@ -105,9 +102,36 @@ impl TcpStream {
         }
     }
 
+    pub async fn read_exact<T: IoBufMut + Send + Sync>(&self, mut buf: T) -> (io::Result<()>, T) {
+        let mut read = 0;
+        let len = buf.buf_capacity();
+
+        while read < len {
+            let (res, slice) = self.read(buf.slice(read..)).await;
+            match res {
+                Err(err) => return (Err(err), slice.into_inner()),
+                Ok(0) => {
+                    return (
+                        Err(io::Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "failed to fill whole buffer",
+                        )),
+                        slice.into_inner(),
+                    );
+                }
+                Ok(n) => {
+                    buf = slice.into_inner();
+                    read += n;
+                }
+            }
+        }
+
+        (Ok(()), buf)
+    }
+
     /// Write a buffer into this [`TcpStream`], returning how many bytes were written and buffer
     /// itself.
-    pub async fn write<T: IoBuf + Send + Sync + 'static>(&self, buf: T) -> (io::Result<usize>, T) {
+    pub async fn write<T: IoBuf + Send + Sync>(&self, buf: T) -> (io::Result<usize>, T) {
         if buf.buf_len() == 0 {
             return (Ok(0), buf);
         }
@@ -163,6 +187,33 @@ impl TcpStream {
                 (res, buf)
             }
         }
+    }
+
+    pub async fn write_all<T: IoBuf + Send + Sync>(&self, mut buf: T) -> (io::Result<()>, T) {
+        let mut written = 0;
+        let len = buf.buf_len();
+
+        while written < len {
+            let (res, slice) = self.write(buf.slice(written..)).await;
+            match res {
+                Err(err) => return (Err(err), slice.into_inner()),
+                Ok(0) => {
+                    return (
+                        Err(io::Error::new(
+                            ErrorKind::WriteZero,
+                            "failed to write whole buffer",
+                        )),
+                        slice.into_inner(),
+                    );
+                }
+                Ok(n) => {
+                    written += n;
+                    buf = slice.into_inner();
+                }
+            }
+        }
+
+        (Ok(()), buf)
     }
 
     /// Shuts down the write halves of this connection.

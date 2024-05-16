@@ -37,7 +37,7 @@ impl UdpSocket {
     }
 
     /// Receives a single datagram message on the [`UdpSocket`]
-    pub async fn recv<T: IoBufMut + Send + Sync + 'static>(
+    pub async fn recv<T: IoBufMut + Send + Sync>(
         &self,
         buf: T,
     ) -> (io::Result<(usize, SocketAddr)>, T) {
@@ -95,7 +95,7 @@ impl UdpSocket {
     }
 
     /// Sends data on the [`UdpSocket`]
-    pub async fn send<T: IoBuf + Send + Sync + 'static>(
+    pub async fn send<T: IoBuf + Send + Sync>(
         &self,
         buf: Vec<u8>,
         addr: SocketAddr,
