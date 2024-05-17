@@ -61,25 +61,26 @@ async fn ipv6_echo(tcp_acceptor: &mut TcpAcceptor) {
         .await
     });
 
-    let mut accept_tcp = tcp_acceptor.try_next().await.unwrap().unwrap();
+    let accept_tcp = tcp_acceptor.try_next().await.unwrap().unwrap();
     let mut connect_tcp = connect_task.await.unwrap();
 
     info!("connect and accept done");
 
     connect_tcp.write_all(b"test").await.unwrap();
     connect_tcp.flush().await.unwrap();
-    let mut buf = [0; 4];
-    accept_tcp.read_exact(&mut buf).await.unwrap();
+    let buf = [0; 4];
+    let (res, mut buf) = accept_tcp.read_exact(buf).await;
+    res.unwrap();
     assert_eq!(buf.as_slice(), b"test");
 
-    accept_tcp.write_all(b"test").await.unwrap();
-    accept_tcp.flush().await.unwrap();
+    let (res, _) = accept_tcp.write_all(b"test").await;
+    res.unwrap();
 
     connect_tcp.read_exact(&mut buf).await.unwrap();
     assert_eq!(buf.as_slice(), b"test");
 
     // equal shutdown write
-    accept_tcp.close().await.unwrap();
+    accept_tcp.shutdown().await.unwrap();
     assert_eq!(connect_tcp.read(&mut [0; 1]).await.unwrap(), 0);
 }
 
@@ -87,25 +88,25 @@ async fn ipv4_echo(tcp_acceptor: &mut TcpAcceptor) {
     let connect_task =
         async_global_executor::spawn(async { TcpStream::connect("192.168.200.20:80").await });
 
-    let mut accept_tcp = tcp_acceptor.try_next().await.unwrap().unwrap();
+    let accept_tcp = tcp_acceptor.try_next().await.unwrap().unwrap();
     let mut connect_tcp = connect_task.await.unwrap();
 
     info!("connect and accept done");
 
     connect_tcp.write_all(b"test").await.unwrap();
     connect_tcp.flush().await.unwrap();
-    let mut buf = [0; 4];
-    accept_tcp.read_exact(&mut buf).await.unwrap();
+    let buf = [0; 4];
+    let (res, mut buf) = accept_tcp.read_exact(buf).await;
+    res.unwrap();
     assert_eq!(buf.as_slice(), b"test");
 
-    accept_tcp.write_all(b"test").await.unwrap();
-    accept_tcp.flush().await.unwrap();
+    accept_tcp.write_all(b"test").await.0.unwrap();
 
     connect_tcp.read_exact(&mut buf).await.unwrap();
     assert_eq!(buf.as_slice(), b"test");
 
     // equal shutdown write
-    accept_tcp.close().await.unwrap();
+    accept_tcp.shutdown().await.unwrap();
     assert_eq!(connect_tcp.read(&mut [0; 1]).await.unwrap(), 0);
 }
 

@@ -59,13 +59,14 @@ fn main() {
 
         info!("udp connect and accept done");
 
-        let mut buf = [0; 4];
-        accept_udp.recv(&mut buf).await.unwrap();
+        let buf = [0; 4];
+        let (res, mut buf) = accept_udp.recv(buf).await;
+        let src_addr = res.unwrap().1;
         assert_eq!(buf.as_slice(), b"test");
 
         info!("connect send accept recv done");
 
-        accept_udp.send(b"test").await.unwrap();
+        accept_udp.send(b"test", src_addr).await.0.unwrap();
 
         info!("accept send done");
 

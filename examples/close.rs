@@ -13,7 +13,7 @@ use netlink_sys::SmolSocket;
 use rtnetlink::Handle;
 use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
 use tracing::level_filters::LevelFilter;
-use tracing::{info, subscriber};
+use tracing::{error, info, subscriber};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::{fmt, Registry};
 use tun::Layer;
@@ -40,20 +40,25 @@ fn main() {
 
         info!("create tcp stack done");
 
-        let _stack_task = async_global_executor::spawn(async move { tcp_stack.run().await });
+        let _stack_task = async_global_executor::spawn(async move {
+            if let Err(err) = tcp_stack.run().await {
+                error!(%err, "tcp stack failed");
+            }
+        });
 
         let connect_task =
             async_global_executor::spawn(async { TcpStream::connect("192.168.200.20:80").await });
 
-        let mut accept_tcp = tcp_acceptor.try_next().await.unwrap().unwrap();
+        let accept_tcp = tcp_acceptor.try_next().await.unwrap().unwrap();
         let mut connect_tcp = connect_task.await.unwrap();
 
         info!("connect and accept done");
 
         connect_tcp.write_all(b"test").await.unwrap();
         connect_tcp.flush().await.unwrap();
-        let mut buf = [0; 4];
-        accept_tcp.read_exact(&mut buf).await.unwrap();
+        let buf = [0; 4];
+        let (res, buf) = accept_tcp.read_exact(buf).await;
+        res.unwrap();
         assert_eq!(buf.as_slice(), b"test");
 
         drop(accept_tcp);
