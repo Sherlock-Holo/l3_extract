@@ -891,13 +891,11 @@ impl<C: AsyncRead + AsyncWrite + Unpin, T: Timer> TcpStack<C, T> {
 
     #[instrument(level = "debug", skip(self), err(Debug))]
     async fn process_write_io(&mut self) -> anyhow::Result<()> {
-        while let Some(packet) = self.virtual_iface.peek_send_packet() {
+        while let Some(packet) = self.virtual_iface.pop_send_packet() {
             self.tun_connection
                 .write(&packet)
                 .await
                 .with_context(|| "write packet to tun failed")?;
-
-            self.virtual_iface.consume_send_packet();
         }
 
         Ok(())

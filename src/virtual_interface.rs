@@ -24,12 +24,8 @@ impl VirtualInterface {
         self.rx_queue.push_back(BytesMut::from(packet));
     }
 
-    pub fn peek_send_packet(&mut self) -> Option<Bytes> {
-        self.tx_queue.front().cloned()
-    }
-
-    pub fn consume_send_packet(&mut self) {
-        self.tx_queue.pop_front().expect("tx queue is empty");
+    pub fn pop_send_packet(&mut self) -> Option<Bytes> {
+        self.tx_queue.pop_front()
     }
 }
 
