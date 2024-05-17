@@ -3,8 +3,9 @@ use std::io::{Error, Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::{AsFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::pin::pin;
+use std::time::Duration;
 
-use async_io::{Async, IoSafe};
+use async_io::{Async, IoSafe, Timer};
 use async_net::UdpSocket;
 use futures_util::TryStreamExt;
 use l3_extract::tcp_stack::TcpStackBuilder;
@@ -34,7 +35,7 @@ fn main() {
             .ipv4_addr(IP)
             .ipv4_gateway(GATEWAY)
             .mtu(MTU)
-            .build(fd)
+            .build(fd, MyTimer::new())
             .unwrap();
 
         info!("create tcp stack done");
@@ -172,5 +173,24 @@ impl Write for SafeFd {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+pub struct MyTimer {
+    inner: Timer,
+}
+
+impl MyTimer {
+    fn new() -> Self {
+        Self {
+            inner: Timer::never(),
+        }
+    }
+}
+
+impl l3_extract::timer::Timer for MyTimer {
+    async fn sleep(&mut self, dur: Duration) {
+        self.inner.set_after(dur);
+        (&mut self.inner).await;
     }
 }

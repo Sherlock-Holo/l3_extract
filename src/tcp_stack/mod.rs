@@ -11,7 +11,6 @@ use anyhow::Context as _;
 use compio_buf::{IoBuf, IoBufMut};
 use crossbeam_channel::SendError;
 use flume::Sender;
-use futures_timer::Delay;
 use futures_util::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, FutureExt};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{DeviceCapabilities, Medium};
@@ -29,6 +28,7 @@ use self::tcp::TcpAcceptor;
 use self::udp::UdpAcceptor;
 use crate::notify_channel::{self, NotifyReceiver, NotifySender};
 use crate::shared_buf::{AsIoBuf, AsIoBufMut, SharedBuf};
+use crate::timer::Timer;
 use crate::virtual_interface::VirtualInterface;
 use crate::wake_fn::wake_once_fn;
 
@@ -111,10 +111,11 @@ impl TcpStackBuilder {
     }
 
     /// Build a [`TcpStack`]
-    pub fn build<C>(
+    pub fn build<C, T>(
         &self,
         connection: C,
-    ) -> anyhow::Result<(TcpStack<C>, TcpAcceptor, UdpAcceptor)> {
+        timer: T,
+    ) -> anyhow::Result<(TcpStack<C, T>, TcpAcceptor, UdpAcceptor)> {
         let ipv4 = match (self.ipv4_addr, self.ipv4_gateway) {
             (None, None) => None,
             (Some(ipv4_addr), Some(ipv4_gateway)) => Some((ipv4_addr, ipv4_gateway)),
@@ -135,12 +136,12 @@ impl TcpStackBuilder {
             }
         };
 
-        TcpStack::new(connection, ipv4, ipv6, self.mtu)
+        TcpStack::new(connection, timer, ipv4, ipv6, self.mtu)
     }
 }
 
 /// TCP network stack
-pub struct TcpStack<C> {
+pub struct TcpStack<C, T> {
     ipv4_addr: Option<Ipv4Addr>,
     ipv4_gateway: Option<Ipv4Addr>,
 
@@ -149,6 +150,8 @@ pub struct TcpStack<C> {
 
     tun_connection: C,
     tun_read_buf: Vec<u8>,
+
+    timer: T,
 
     interface: Interface,
     virtual_iface: VirtualInterface,
@@ -164,7 +167,7 @@ pub struct TcpStack<C> {
     udp_stream_tx: Sender<io::Result<UdpInfo>>,
 }
 
-impl<C> TcpStack<C> {
+impl<C, T> TcpStack<C, T> {
     /// Create a [`TcpStackBuilder`]
     pub fn builder() -> TcpStackBuilder {
         Default::default()
@@ -200,6 +203,7 @@ impl<C> TcpStack<C> {
 
     fn new(
         connection: C,
+        timer: T,
         ipv4: Option<(Ipv4Cidr, Ipv4Addr)>,
         ipv6: Option<(Ipv6Cidr, Ipv6Addr)>,
         mtu: Option<usize>,
@@ -243,6 +247,7 @@ impl<C> TcpStack<C> {
             ipv6_gateway: ipv6.map(|(_, gateway)| gateway),
             tun_connection: connection,
             tun_read_buf: vec![0; mtu],
+            timer,
             interface,
             virtual_iface,
             socket_set: SocketSet::new(vec![]),
@@ -258,7 +263,7 @@ impl<C> TcpStack<C> {
     }
 }
 
-impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
+impl<C: AsyncRead + AsyncWrite + Unpin, T: Timer> TcpStack<C, T> {
     /// Drive [`TcpStack`] run event loop
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let mut sleep = None;
@@ -911,9 +916,9 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
             }
 
             Some(delay) => {
-                let mut timer = Delay::new(delay).fuse();
+                let sleep_fut = self.timer.sleep(delay);
                 futures_util::select! {
-                    _ = timer => return Ok(None),
+                    _ = sleep_fut.fuse() => return Ok(None),
                     _ = events_wait.fuse() => return Ok(None),
                     res = read.fuse() => res?
                 }

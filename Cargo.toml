@@ -26,7 +26,6 @@ compio-buf = "0.3.0"
 derivative = "2.2.0"
 event-listener = "5.3.0"
 flume = { version = "0.11.0", default-features = false, features = ["async"] }
-futures-timer = "3.0.3"
 futures-util = { version = "0.3.30", features = ["io"] }
 rand = "0.8.5"
 smoltcp = "0.11.0"

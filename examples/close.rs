@@ -35,7 +35,7 @@ fn main() {
             .ipv4_addr(IP)
             .ipv4_gateway(GATEWAY)
             .mtu(MTU)
-            .build(fd)
+            .build(fd, MyTimer::new())
             .unwrap();
 
         info!("create tcp stack done");
@@ -164,5 +164,24 @@ impl Write for SafeFd {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+pub struct MyTimer {
+    inner: Timer,
+}
+
+impl MyTimer {
+    fn new() -> Self {
+        Self {
+            inner: Timer::never(),
+        }
+    }
+}
+
+impl l3_extract::timer::Timer for MyTimer {
+    async fn sleep(&mut self, dur: Duration) {
+        self.inner.set_after(dur);
+        (&mut self.inner).await;
     }
 }
