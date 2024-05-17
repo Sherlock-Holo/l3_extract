@@ -11,7 +11,7 @@ use anyhow::Context as _;
 use compio_buf::{IoBuf, IoBufMut};
 use crossbeam_channel::SendError;
 use flume::Sender;
-use futures_util::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, FutureExt};
+use futures_util::FutureExt;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{ChecksumCapabilities, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp::{RecvError, Socket as TcpSocket, SocketBuffer};
@@ -26,6 +26,7 @@ use tracing::{debug, error, instrument};
 use self::event::OperationEvent;
 use self::tcp::TcpAcceptor;
 use self::udp::UdpAcceptor;
+use crate::connection::Connection;
 use crate::notify_channel::{self, NotifyReceiver, NotifySender};
 use crate::shared_buf::{AsIoBuf, AsIoBufMut, SharedBuf};
 use crate::timer::Timer;
@@ -285,7 +286,7 @@ impl<C, T> TcpStack<C, T> {
     }
 }
 
-impl<C: AsyncRead + AsyncWrite + Unpin, T: Timer> TcpStack<C, T> {
+impl<C: Connection, T: Timer> TcpStack<C, T> {
     /// Drive [`TcpStack`] run event loop
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let mut sleep = None;
@@ -915,7 +916,7 @@ impl<C: AsyncRead + AsyncWrite + Unpin, T: Timer> TcpStack<C, T> {
     async fn process_write_io(&mut self) -> anyhow::Result<()> {
         while let Some(packet) = self.virtual_iface.pop_send_packet() {
             self.tun_connection
-                .write(&packet)
+                .sink(&packet)
                 .await
                 .with_context(|| "write packet to tun failed")?;
         }
@@ -926,7 +927,7 @@ impl<C: AsyncRead + AsyncWrite + Unpin, T: Timer> TcpStack<C, T> {
     #[instrument(level = "debug", skip(self), ret, err(Debug))]
     async fn process_read_io(&mut self, sleep: Option<Duration>) -> anyhow::Result<Option<usize>> {
         let events_wait = self.operation_event_rx.wait();
-        let read = self.tun_connection.read(&mut self.tun_read_buf);
+        let read = self.tun_connection.consume(&mut self.tun_read_buf);
         let n = match sleep {
             None => {
                 futures_util::select! {

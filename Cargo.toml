@@ -18,6 +18,10 @@ name = "close"
 [[example]]
 name = "udp_echo"
 
+[features]
+default = ["futures_io_wrapper"]
+futures_io_wrapper = []
+
 [dependencies]
 anyhow = "1.0.83"
 bytes = "1.6.0"

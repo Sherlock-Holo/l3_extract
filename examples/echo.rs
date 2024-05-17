@@ -9,6 +9,7 @@ use std::time::Duration;
 use async_io::{Async, IoSafe, Timer};
 use async_net::TcpStream;
 use futures_util::{AsyncReadExt, AsyncWriteExt, TryStreamExt};
+use l3_extract::connection::FuturesIoWrapper;
 use l3_extract::tcp_stack::TcpStackBuilder;
 use l3_extract::TcpAcceptor;
 use netlink_sys::SmolSocket;
@@ -41,7 +42,7 @@ fn main() {
             .ipv6_addr(ipv6)
             .ipv6_gateway(ipv6_gateway)
             .mtu(MTU)
-            .build(fd, MyTimer::new())
+            .build(FuturesIoWrapper(fd), MyTimer::new())
             .unwrap();
 
         info!("create tcp stack done");
