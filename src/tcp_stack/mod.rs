@@ -13,7 +13,7 @@ use crossbeam_channel::SendError;
 use flume::Sender;
 use futures_util::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, FutureExt};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::{DeviceCapabilities, Medium};
+use smoltcp::phy::{ChecksumCapabilities, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp::{RecvError, Socket as TcpSocket, SocketBuffer};
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket};
 use smoltcp::time::Instant;
@@ -77,6 +77,8 @@ pub struct TcpStackBuilder {
     ipv6_gateway: Option<Ipv6Addr>,
 
     mtu: Option<usize>,
+
+    checksum_capabilities: Option<ChecksumCapabilities>,
 }
 
 impl TcpStackBuilder {
@@ -110,6 +112,15 @@ impl TcpStackBuilder {
         self
     }
 
+    /// Set custom checksum capabilities, default value is [`ChecksumCapabilities::default`]
+    pub fn checksum_capabilities(
+        &mut self,
+        checksum_capabilities: ChecksumCapabilities,
+    ) -> &mut Self {
+        self.checksum_capabilities = Some(checksum_capabilities);
+        self
+    }
+
     /// Build a [`TcpStack`]
     pub fn build<C, T>(
         &self,
@@ -136,7 +147,14 @@ impl TcpStackBuilder {
             }
         };
 
-        TcpStack::new(connection, timer, ipv4, ipv6, self.mtu)
+        TcpStack::new(
+            connection,
+            timer,
+            ipv4,
+            ipv6,
+            self.mtu,
+            self.checksum_capabilities.clone(),
+        )
     }
 }
 
@@ -207,12 +225,16 @@ impl<C, T> TcpStack<C, T> {
         ipv4: Option<(Ipv4Cidr, Ipv4Addr)>,
         ipv6: Option<(Ipv6Cidr, Ipv6Addr)>,
         mtu: Option<usize>,
+        checksum_capabilities: Option<ChecksumCapabilities>,
     ) -> anyhow::Result<(Self, TcpAcceptor, UdpAcceptor)> {
         let mtu = mtu.unwrap_or(MTU);
 
         let mut tun_capabilities = DeviceCapabilities::default();
         tun_capabilities.max_transmission_unit = mtu;
         tun_capabilities.medium = Medium::Ip;
+        if let Some(checksum_capabilities) = checksum_capabilities {
+            tun_capabilities.checksum = checksum_capabilities;
+        }
 
         let mut virtual_iface = VirtualInterface::new(tun_capabilities);
 

@@ -2,6 +2,8 @@
 
 pub use compio_buf::*;
 #[doc(inline)]
+pub use smoltcp::phy::{Checksum, ChecksumCapabilities};
+#[doc(inline)]
 pub use smoltcp::wire::{Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr};
 #[doc(inline)]
 pub use tcp_stack::{
