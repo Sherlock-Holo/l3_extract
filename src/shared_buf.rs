@@ -36,8 +36,6 @@ pub trait AsIoBufMut: Send + Sync {
     #[allow(clippy::mut_from_ref)]
     unsafe fn as_slice_mut(&self) -> &mut [u8];
 
-    unsafe fn initiated_len(&self) -> usize;
-
     unsafe fn set_initiated_len(&self, new_len: usize);
 }
 
@@ -57,10 +55,6 @@ impl<T: IoBufMut + Send + Sync> AsIoBufMut for SharedBuf<T> {
         let ptr = slice.as_mut_ptr();
 
         slice::from_raw_parts_mut(ptr.cast(), len)
-    }
-
-    unsafe fn initiated_len(&self) -> usize {
-        (*self.inner.get()).buf_len()
     }
 
     unsafe fn set_initiated_len(&self, new_len: usize) {

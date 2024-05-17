@@ -97,7 +97,7 @@ impl UdpSocket {
     /// Sends data on the [`UdpSocket`]
     pub async fn send<T: IoBuf + Send + Sync>(
         &self,
-        buf: Vec<u8>,
+        buf: T,
         addr: SocketAddr,
     ) -> (io::Result<usize>, T) {
         let buf = Arc::new(SharedBuf::new(buf)) as Arc<dyn AsIoBuf>;

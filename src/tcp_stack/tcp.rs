@@ -45,10 +45,6 @@ impl TcpStream {
     /// Pull some bytes from this [`TcpStream`] into the specified buffer, returning how many bytes
     /// were read and the buffer itself.
     pub async fn read<T: IoBufMut + Send + Sync>(&self, buf: T) -> (io::Result<usize>, T) {
-        if buf.buf_capacity() - buf.buf_len() == 0 {
-            return (Ok(0), buf);
-        }
-
         let buf = Arc::new(SharedBuf::new(buf)) as Arc<dyn AsIoBufMut>;
         let (tx, rx) = flume::bounded(1);
         if let Err(SendError(event)) = self.operation_event_tx.send(OperationEvent::Read {
@@ -132,10 +128,6 @@ impl TcpStream {
     /// Write a buffer into this [`TcpStream`], returning how many bytes were written and buffer
     /// itself.
     pub async fn write<T: IoBuf + Send + Sync>(&self, buf: T) -> (io::Result<usize>, T) {
-        if buf.buf_len() == 0 {
-            return (Ok(0), buf);
-        }
-
         let buf = Arc::new(SharedBuf::new(buf)) as Arc<dyn AsIoBuf>;
         let (tx, rx) = flume::bounded(1);
         if let Err(SendError(event)) = self.operation_event_tx.send(OperationEvent::Write {

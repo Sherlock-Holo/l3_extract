@@ -626,8 +626,7 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                         }
 
                         Ok(n) => {
-                            let new_len = buffer.initiated_len() + n;
-                            buffer.set_initiated_len(new_len);
+                            buffer.set_initiated_len(n);
 
                             drop(buffer);
                             let _ = result_tx.send(Ok(n));
@@ -781,8 +780,7 @@ impl<C: AsyncRead + AsyncWrite + Unpin> TcpStack<C> {
                                 metadata.endpoint.port,
                             );
 
-                            let new_len = buffer.initiated_len() + n;
-                            buffer.set_initiated_len(new_len);
+                            buffer.set_initiated_len(n);
                             drop(buffer);
 
                             let _ = result_tx.send(Ok((n, addr)));
