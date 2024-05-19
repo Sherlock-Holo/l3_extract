@@ -1,4 +1,4 @@
-//! TCP utility types
+//! TCP utility types.
 
 use std::io;
 use std::io::ErrorKind;
@@ -19,10 +19,10 @@ use super::{cast_dyn_io_buf, cast_dyn_io_buf_mut, TcpInfo, TypedSocketHandle};
 use crate::notify_channel::NotifySender;
 use crate::shared_buf::{AsIoBuf, AsIoBufMut, SharedBuf};
 
-/// A TCP stream, like tokio/async-net TcpStream
+/// A TCP stream, like tokio/async-net TcpStream.
 ///
 /// This TCP stream doesn't like normal [`std::net::TcpStream`] which accepted by
-/// [`std::net::TcpListener`], it is a **client** side TCP stream
+/// [`std::net::TcpListener`], it is a **client** side TCP stream.
 #[derive(Debug)]
 pub struct TcpStream {
     local_addr: SocketAddr,
@@ -32,12 +32,12 @@ pub struct TcpStream {
 }
 
 impl TcpStream {
-    /// Get local socket addr
+    /// Get local socket addr.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
-    /// Get peer socket addr
+    /// Get peer socket addr.
     pub fn peer_addr(&self) -> SocketAddr {
         self.remote_addr
     }
@@ -98,6 +98,10 @@ impl TcpStream {
         }
     }
 
+    /// Read the exact number of bytes required to fill `buf`.
+    ///
+    /// This function reads as many bytes as necessary to completely fill the specified buffer
+    /// `buf`.
     pub async fn read_exact<T: IoBufMut + Send + Sync>(&self, mut buf: T) -> (io::Result<()>, T) {
         let mut read = 0;
         let len = buf.buf_capacity();
@@ -181,6 +185,11 @@ impl TcpStream {
         }
     }
 
+    /// Attempts to write an entire buffer into this writer.
+    ///
+    /// This method will continuously call [write] until there is no more data to be written.
+    ///
+    /// [write]: Self::write
     pub async fn write_all<T: IoBuf + Send + Sync>(&self, mut buf: T) -> (io::Result<()>, T) {
         let mut written = 0;
         let len = buf.buf_len();
@@ -247,7 +256,7 @@ impl Drop for TcpStream {
 }
 
 /// A TCP socket acceptor, like [`std::net::TcpListener`], but you will accept a client side TCP
-/// stream, not server side
+/// stream, not server side.
 #[derive(Derivative)]
 #[derivative(Debug)]
 pub struct TcpAcceptor {

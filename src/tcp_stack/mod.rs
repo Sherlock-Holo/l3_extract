@@ -68,7 +68,7 @@ pub(crate) struct UdpInfo {
     remote_addr: SocketAddr,
 }
 
-/// a [`TcpStack`] builder
+/// A [`TcpStack`] builder.
 #[derive(Debug, Clone, Default)]
 pub struct TcpStackBuilder {
     ipv4_addr: Option<Ipv4Cidr>,
@@ -83,37 +83,37 @@ pub struct TcpStackBuilder {
 }
 
 impl TcpStackBuilder {
-    /// Set ipv4 addr
+    /// Set ipv4 addr.
     pub fn ipv4_addr(&mut self, ipv4_addr: Ipv4Cidr) -> &mut Self {
         self.ipv4_addr = Some(ipv4_addr);
         self
     }
 
-    /// Set ipv4 gateway
+    /// Set ipv4 gateway.
     pub fn ipv4_gateway(&mut self, ipv4_gateway: Ipv4Addr) -> &mut Self {
         self.ipv4_gateway = Some(ipv4_gateway);
         self
     }
 
-    /// Set ipv6 addr
+    /// Set ipv6 addr.
     pub fn ipv6_addr(&mut self, ipv6_addr: Ipv6Cidr) -> &mut Self {
         self.ipv6_addr = Some(ipv6_addr);
         self
     }
 
-    /// Set ipv6 gateway
+    /// Set ipv6 gateway.
     pub fn ipv6_gateway(&mut self, ipv6_gateway: Ipv6Addr) -> &mut Self {
         self.ipv6_gateway = Some(ipv6_gateway);
         self
     }
 
-    /// Set MTU, default is 1500
+    /// Set MTU, default is 1500.
     pub fn mtu(&mut self, mtu: usize) -> &mut Self {
         self.mtu = Some(mtu);
         self
     }
 
-    /// Set custom checksum capabilities, default value is [`ChecksumCapabilities::default`]
+    /// Set custom checksum capabilities, default value is [`ChecksumCapabilities::default`].
     pub fn checksum_capabilities(
         &mut self,
         checksum_capabilities: ChecksumCapabilities,
@@ -122,7 +122,7 @@ impl TcpStackBuilder {
         self
     }
 
-    /// Build a [`TcpStack`]
+    /// Build a [`TcpStack`].
     pub fn build<C, T>(
         &self,
         connection: C,
@@ -159,7 +159,7 @@ impl TcpStackBuilder {
     }
 }
 
-/// TCP network stack
+/// TCP network stack.
 pub struct TcpStack<C, T> {
     ipv4_addr: Option<Ipv4Addr>,
     ipv4_gateway: Option<Ipv4Addr>,
@@ -187,35 +187,37 @@ pub struct TcpStack<C, T> {
 }
 
 impl<C, T> TcpStack<C, T> {
-    /// Create a [`TcpStackBuilder`]
+    /// Create a [`TcpStackBuilder`].
     pub fn builder() -> TcpStackBuilder {
         Default::default()
     }
 
-    /// Get virtual interface ipv4 addr
+    /// Get virtual interface ipv4 addr.
     pub fn iface_ipv4_addr(&self) -> Option<Ipv4Addr> {
         self.ipv4_addr
     }
 
-    /// Get virtual interface ipv4 gateway
+    /// Get virtual interface ipv4 gateway.
     pub fn iface_ipv4_gateway(&self) -> Option<Ipv4Addr> {
         self.ipv4_gateway
     }
 
-    /// Get virtual interface ipv6 addr
+    /// Get virtual interface ipv6 addr.
     pub fn iface_ipv6_addr(&self) -> Option<Ipv6Addr> {
         self.ipv6_addr
     }
 
-    /// Get virtual interface ipv6 gateway
+    /// Get virtual interface ipv6 gateway.
     pub fn iface_ipv6_gateway(&self) -> Option<Ipv6Addr> {
         self.ipv6_gateway
     }
 
+    /// Get the connection reference.
     pub fn connection_ref(&self) -> &C {
         &self.tun_connection
     }
 
+    /// Get the connection mutable reference.
     pub fn connection_mut(&mut self) -> &mut C {
         &mut self.tun_connection
     }
@@ -287,7 +289,7 @@ impl<C, T> TcpStack<C, T> {
 }
 
 impl<C: Connection, T: Timer> TcpStack<C, T> {
-    /// Drive [`TcpStack`] run event loop
+    /// Drive [`TcpStack`] run event loop.
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let mut sleep = None;
         loop {

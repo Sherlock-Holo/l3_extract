@@ -9,5 +9,6 @@ use std::time::Duration;
 /// [TcpStack]: crate::TcpStack
 #[allow(async_fn_in_trait)]
 pub trait Timer {
+    /// Sleep with given duration.
     async fn sleep(&mut self, dur: Duration);
 }

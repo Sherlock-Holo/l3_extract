@@ -1,4 +1,4 @@
-//! UDP utility types
+//! UDP utility types.
 
 use std::io;
 use std::io::ErrorKind;
@@ -19,10 +19,9 @@ use super::{cast_dyn_io_buf, cast_dyn_io_buf_mut, TypedSocketHandle, UdpInfo};
 use crate::notify_channel::NotifySender;
 use crate::shared_buf::{AsIoBuf, AsIoBufMut, SharedBuf};
 
-/// A UDP socket, like tokio/async-net UdpSocket
+/// A UDP socket, like tokio/async-net UdpSocket.
 ///
-/// This UDP socket is a **client** side UDP socket, like [`std::net::UdpSocket`] which has called
-/// [connect](std::net::UdpSocket::connect)
+/// This UDP socket is a **server** side UDP socket, like [`std::net::UdpSocket`].
 #[derive(Debug)]
 pub struct UdpSocket {
     remote_addr: SocketAddr,
@@ -31,12 +30,13 @@ pub struct UdpSocket {
 }
 
 impl UdpSocket {
-    /// Get peer socket addr
+    /// Get peer socket addr.
     pub fn peer_addr(&self) -> SocketAddr {
         self.remote_addr
     }
 
-    /// Receives a single datagram message on the [`UdpSocket`]
+    /// Receives a single datagram message on the [`UdpSocket`], and return the `buf` and source
+    /// `addr`.
     pub async fn recv<T: IoBufMut + Send + Sync>(
         &self,
         buf: T,
@@ -94,7 +94,7 @@ impl UdpSocket {
         }
     }
 
-    /// Sends data on the [`UdpSocket`]
+    /// Sends data to specify `addr` on the [`UdpSocket`].
     pub async fn send<T: IoBuf + Send + Sync>(
         &self,
         buf: T,
@@ -164,7 +164,7 @@ impl Drop for UdpSocket {
 }
 
 /// a UDP socket acceptor, like [TcpAcceptor](super::tcp::TcpAcceptor), but you will accept a
-/// client side UDP socket, not server side
+/// client side UDP socket, not server side.
 #[derive(Derivative)]
 #[derivative(Debug)]
 pub struct UdpAcceptor {

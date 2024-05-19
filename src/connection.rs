@@ -8,19 +8,19 @@ pub use self::futures_io_wrapper::FuturesIoWrapper;
 
 /// Layer 3 connection.
 ///
-/// [TcpStack] will consume and sink layer 3 Packet through the connection
+/// [TcpStack] will consume and sink layer 3 Packet through the connection.
 ///
 /// [TcpStack]: crate::TcpStack
 #[allow(async_fn_in_trait)]
 pub trait Connection {
-    /// Consume a layer 3 packet from the connection
+    /// Consume a layer 3 packet from the connection.
     ///
     /// # Notes:
     ///
-    /// this method **MUST** be cancelable
+    /// this method **MUST** be cancelable.
     async fn consume(&mut self, buf: &mut [u8]) -> io::Result<usize>;
 
-    /// Sink a layer 3 packet to the connection
+    /// Sink a layer 3 packet to the connection.
     async fn sink(&mut self, packet: &[u8]) -> io::Result<()>;
 }
 
@@ -32,7 +32,7 @@ mod futures_io_wrapper {
 
     use super::Connection;
 
-    /// A futures-io [`AsyncRead`], [`AsyncWrite`] wrapper, implement the [`Connection`] trait
+    /// A futures-io [`AsyncRead`], [`AsyncWrite`] wrapper, implement the [`Connection`] trait.
     #[derive(Debug)]
     pub struct FuturesIoWrapper<T>(pub T);
 
