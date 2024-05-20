@@ -3,18 +3,24 @@ use std::io::{Error, Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::{AsFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::pin::pin;
-use std::time::Duration;
+use std::sync::Arc;
 
-use async_io::{Async, IoSafe, Timer};
+use anyhow::Context;
+use async_global_executor::Task;
+use async_io::{Async, IoSafe};
 use async_net::TcpStream;
-use futures_util::{AsyncWriteExt, TryStreamExt};
-use l3_extract::connection::FuturesIoWrapper;
+use bytes::{Bytes, BytesMut};
+use flume::Selector;
+use futures_util::future::Either;
+use futures_util::{AsyncReadExt, AsyncWriteExt, TryStreamExt};
+use l3_extract::event::EventGenerator;
 use l3_extract::tcp_stack::TcpStackBuilder;
+use l3_extract::TcpStack;
 use netlink_sys::SmolSocket;
 use rtnetlink::Handle;
 use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
 use tracing::level_filters::LevelFilter;
-use tracing::{error, info, subscriber};
+use tracing::{info, subscriber};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::{fmt, Registry};
 use tun::Layer;
@@ -32,20 +38,18 @@ fn main() {
 
         info!("create tun done");
 
-        let (mut tcp_stack, mut tcp_acceptor, _) = TcpStackBuilder::default()
+        let (tcp_stack, event_generator, mut tcp_acceptor, _) = TcpStackBuilder::default()
             .ipv4_addr(IP)
             .ipv4_gateway(GATEWAY)
             .mtu(MTU)
-            .build(FuturesIoWrapper(fd), MyTimer::new())
+            .build()
             .unwrap();
 
         info!("create tcp stack done");
 
-        let _stack_task = async_global_executor::spawn(async move {
-            if let Err(err) = tcp_stack.run().await {
-                error!(%err, "tcp stack failed");
-            }
-        });
+        for task in run_stack(fd, tcp_stack, event_generator) {
+            task.detach();
+        }
 
         let connect_task =
             async_global_executor::spawn(async { TcpStream::connect("192.168.200.20:80").await });
@@ -65,6 +69,96 @@ fn main() {
         drop(connect_tcp);
         assert_eq!(accept_tcp.read(buf).await.0.unwrap(), 0);
     });
+}
+
+fn run_stack(
+    fd: Async<SafeFd>,
+    mut tcp_stack: TcpStack,
+    mut event_generator: EventGenerator,
+) -> Vec<Task<anyhow::Result<()>>> {
+    let fd = Arc::new(fd);
+    let (read_packet_tx, read_packet_rx) = flume::unbounded();
+    let read_task = async_global_executor::spawn({
+        let fd = fd.clone();
+        async move {
+            let mut buffer = BytesMut::with_capacity(MTU);
+            loop {
+                if buffer.len() < MTU {
+                    buffer.resize(MTU, 0);
+                }
+
+                let n = (&mut (&*fd)).read(&mut buffer).await?;
+                if n == 0 {
+                    return Err(anyhow::anyhow!("tun read EOF"));
+                }
+
+                read_packet_tx.send_async(buffer.split_to(n)).await?
+            }
+        }
+    });
+
+    let (write_packet_tx, write_packet_rx) = flume::unbounded::<Bytes>();
+    let write_task = async_global_executor::spawn(async move {
+        while let Ok(packet) = write_packet_rx.recv_async().await {
+            (&mut (&*fd)).write(&packet).await.map(|_| ())?;
+        }
+
+        Err(anyhow::anyhow!("TcpStack stopped"))
+    });
+
+    let (events_tx, events_rx) = flume::unbounded();
+    let events_task = async_global_executor::spawn(async move {
+        loop {
+            let events = event_generator.generate().await?;
+            events_tx.send(events)?;
+        }
+    });
+
+    let drive_task = async_global_executor::spawn_blocking(move || {
+        let mut sleep = None;
+        loop {
+            let selector = Selector::new()
+                .recv(&read_packet_rx, |packet| {
+                    packet
+                        .map(Either::Left)
+                        .with_context(|| "read packet failed")
+                })
+                .recv(&events_rx, |events| {
+                    events
+                        .map(Either::Right)
+                        .with_context(|| "read events failed")
+                });
+
+            let res = match sleep {
+                None => Some(selector.wait()),
+
+                Some(sleep) => selector.wait_timeout(sleep).ok(),
+            };
+
+            let (write_packets, new_sleep) = match res {
+                None => tcp_stack.drive_once(None, None)?,
+
+                Some(Err(err)) => return Err(err),
+                Some(Ok(Either::Left(packet))) => {
+                    let events = events_rx.try_recv().ok();
+
+                    tcp_stack.drive_once(Some(packet), events)?
+                }
+                Some(Ok(Either::Right(events))) => {
+                    let packet = read_packet_rx.try_recv().ok();
+
+                    tcp_stack.drive_once(packet, Some(events))?
+                }
+            };
+            sleep = new_sleep;
+
+            for packet in write_packets {
+                write_packet_tx.send(packet)?;
+            }
+        }
+    });
+
+    vec![read_task, write_task, events_task, drive_task]
 }
 
 async fn create_tun() -> Async<SafeFd> {
@@ -149,37 +243,18 @@ impl AsFd for SafeFd {
     }
 }
 
-impl Read for SafeFd {
+impl Read for &SafeFd {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         rustix::io::read(&self.0, buf).map_err(Error::from)
     }
 }
 
-impl Write for SafeFd {
+impl Write for &SafeFd {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         rustix::io::write(&self.0, buf).map_err(Error::from)
     }
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
-    }
-}
-
-pub struct MyTimer {
-    inner: Timer,
-}
-
-impl MyTimer {
-    fn new() -> Self {
-        Self {
-            inner: Timer::never(),
-        }
-    }
-}
-
-impl l3_extract::timer::Timer for MyTimer {
-    async fn sleep(&mut self, dur: Duration) {
-        self.inner.set_after(dur);
-        (&mut self.inner).await;
     }
 }

@@ -21,10 +21,6 @@ name = "passive_close"
 [[example]]
 name = "udp_echo"
 
-[features]
-default = ["futures_io_wrapper"]
-futures_io_wrapper = []
-
 [dependencies]
 anyhow = "1.0.86"
 bytes = "1.6.0"
@@ -36,12 +32,14 @@ flume = { version = "0.11.0", default-features = false, features = ["async"] }
 futures-util = { version = "0.3.30", features = ["io"] }
 rand = "0.8.5"
 smoltcp = "0.11.0"
+thiserror = "1.0.61"
 tracing = "0.1.40"
 
 [dev-dependencies]
 async-global-executor = "2.4.1"
 async-io = "2.3.2"
 async-net = "2.0.0"
+flume = "0.11.0"
 netlink-sys = { version = "0.8.6", features = ["smol_socket"] }
 rtnetlink = { version = "0.14.1", default-features = false, features = ["smol_socket"] }
 rustix = "0.38.34"

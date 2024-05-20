@@ -8,13 +8,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use compio_buf::{IoBuf, IoBufMut};
 use crossbeam_channel::SendError;
 use flume::Sender;
-use futures_util::FutureExt;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium};
+use smoltcp::phy::{ChecksumCapabilities, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp::{RecvError, Socket as TcpSocket, SocketBuffer};
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket};
 use smoltcp::time::Instant;
@@ -24,17 +23,15 @@ use smoltcp::wire::{
 };
 use tracing::{debug, error, instrument};
 
-use self::event::OperationEvent;
+use self::event::{EventGenerator, Events, OperationEvent};
 use self::tcp::TcpAcceptor;
 use self::udp::UdpAcceptor;
-use crate::connection::Connection;
-use crate::notify_channel::{self, NotifyReceiver, NotifySender};
+use crate::notify_channel::{self, NotifySender};
 use crate::shared_buf::{AsIoBuf, AsIoBufMut, SharedBuf};
-use crate::timer::Timer;
 use crate::virtual_interface::VirtualInterface;
 use crate::wake_fn::wake_once_fn;
 
-mod event;
+pub mod event;
 pub mod tcp;
 pub mod udp;
 
@@ -132,11 +129,7 @@ impl TcpStackBuilder {
     }
 
     /// Build a [`TcpStack`].
-    pub fn build<C, T>(
-        &self,
-        connection: C,
-        timer: T,
-    ) -> anyhow::Result<(TcpStack<C, T>, TcpAcceptor, UdpAcceptor)> {
+    pub fn build(&self) -> anyhow::Result<(TcpStack, EventGenerator, TcpAcceptor, UdpAcceptor)> {
         let ipv4 = match (self.ipv4_addr, self.ipv4_gateway) {
             (None, None) => None,
             (Some(ipv4_addr), Some(ipv4_gateway)) => Some((ipv4_addr, ipv4_gateway)),
@@ -158,8 +151,6 @@ impl TcpStackBuilder {
         };
 
         TcpStack::new(
-            connection,
-            timer,
             ipv4,
             ipv6,
             self.tcp_socket_buf_size,
@@ -170,7 +161,7 @@ impl TcpStackBuilder {
 }
 
 /// TCP network stack.
-pub struct TcpStack<C, T> {
+pub struct TcpStack {
     ipv4_addr: Option<Ipv4Addr>,
     ipv4_gateway: Option<Ipv4Addr>,
 
@@ -178,11 +169,6 @@ pub struct TcpStack<C, T> {
     ipv6_gateway: Option<Ipv6Addr>,
 
     tcp_socket_buf_size: usize,
-
-    tun_connection: C,
-    tun_read_buf: BytesMut,
-
-    timer: T,
 
     interface: Interface,
     virtual_iface: VirtualInterface,
@@ -192,13 +178,12 @@ pub struct TcpStack<C, T> {
     accepted_udp_sockets: HashSet<SocketAddr>,
 
     operation_event_tx: NotifySender<OperationEvent>,
-    operation_event_rx: NotifyReceiver<OperationEvent>,
 
     tcp_stream_tx: Sender<io::Result<TcpInfo>>,
     udp_stream_tx: Sender<io::Result<UdpInfo>>,
 }
 
-impl<C, T> TcpStack<C, T> {
+impl TcpStack {
     /// Create a [`TcpStackBuilder`].
     pub fn builder() -> TcpStackBuilder {
         Default::default()
@@ -224,25 +209,13 @@ impl<C, T> TcpStack<C, T> {
         self.ipv6_gateway
     }
 
-    /// Get the connection reference.
-    pub fn connection_ref(&self) -> &C {
-        &self.tun_connection
-    }
-
-    /// Get the connection mutable reference.
-    pub fn connection_mut(&mut self) -> &mut C {
-        &mut self.tun_connection
-    }
-
     fn new(
-        connection: C,
-        timer: T,
         ipv4: Option<(Ipv4Cidr, Ipv4Addr)>,
         ipv6: Option<(Ipv6Cidr, Ipv6Addr)>,
         tcp_socket_buf_size: Option<usize>,
         mtu: Option<usize>,
         checksum_capabilities: Option<ChecksumCapabilities>,
-    ) -> anyhow::Result<(Self, TcpAcceptor, UdpAcceptor)> {
+    ) -> anyhow::Result<(Self, EventGenerator, TcpAcceptor, UdpAcceptor)> {
         let mtu = mtu.unwrap_or(MTU);
 
         let mut tun_capabilities = DeviceCapabilities::default();
@@ -278,44 +251,67 @@ impl<C, T> TcpStack<C, T> {
             operation_event_tx: operation_event_tx.clone(),
         };
 
+        let event_generator = EventGenerator {
+            receiver: operation_event_rx,
+        };
+
         let this = Self {
             ipv4_addr: ipv4.map(|(addr, _)| addr.address().into()),
             ipv4_gateway: ipv4.map(|(_, gateway)| gateway),
             ipv6_addr: ipv6.map(|(addr, _)| addr.address().into()),
             ipv6_gateway: ipv6.map(|(_, gateway)| gateway),
             tcp_socket_buf_size: tcp_socket_buf_size.unwrap_or(SOCKET_BUF_SIZE),
-            tun_connection: connection,
-            tun_read_buf: BytesMut::with_capacity(mtu),
-            timer,
             interface,
             virtual_iface,
             socket_set: SocketSet::new(vec![]),
             socket_handles: Default::default(),
             accepted_udp_sockets: Default::default(),
             operation_event_tx,
-            operation_event_rx,
             tcp_stream_tx,
             udp_stream_tx,
         };
 
-        Ok((this, tcp_acceptor, udp_acceptor))
+        Ok((this, event_generator, tcp_acceptor, udp_acceptor))
     }
 }
 
-impl<C: Connection, T: Timer> TcpStack<C, T> {
-    /// Drive [`TcpStack`] run event loop.
-    pub async fn run(&mut self) -> anyhow::Result<()> {
-        let mut sleep = None;
-        loop {
-            sleep = self.drive_one(sleep).await?;
+impl TcpStack {
+    /// Drive [`TcpStack`] run event loop once.
+    ///
+    /// `drive_once` will return packets iterator which should be sent, and the re-drive interval
+    /// if [`TcpStack`] need to be driven once again
+    pub fn drive_once(
+        &mut self,
+        packet: Option<BytesMut>,
+        events: Option<Events>,
+    ) -> anyhow::Result<(impl IntoIterator<Item = Bytes>, Option<Duration>)> {
+        if let Some(packet) = packet {
+            if let Some(packet_type) = parse_packet(&packet) {
+                match packet_type {
+                    PacketType::Tcp { src, dst } => {
+                        debug!(%src, %dst, "get new tcp syn packet");
+
+                        self.init_tcp(dst)?;
+
+                        debug!(%src, %dst, "add new listen socket done");
+                    }
+
+                    PacketType::Udp { src, dst } => {
+                        debug!(%src, %dst, "get udp packet");
+
+                        if self.try_init_udp(dst)? {
+                            debug!(%src, %dst, "try init udp done");
+                        }
+                    }
+                }
+            }
+
+            debug!(read_len = packet.len(), "process read io done");
+
+            self.virtual_iface.push_receive_packet(packet);
+
+            debug!("process packet done");
         }
-    }
-
-    #[instrument(level = "debug", skip(self), err(Debug))]
-    async fn drive_one(&mut self, sleep: Option<Duration>) -> anyhow::Result<Option<Duration>> {
-        self.process_io(sleep).await?;
-
-        debug!("process io done");
 
         let timestamp = Instant::now();
 
@@ -324,66 +320,62 @@ impl<C: Connection, T: Timer> TcpStack<C, T> {
 
         debug!("poll interface done");
 
-        let events = match self.operation_event_rx.collect_nonblock() {
-            Err(err) => return Err(err).with_context(|| "broken operation socket queue"),
-            Ok(events) => events,
-        };
-
-        let mut tcp_events = vec![];
-        let mut udp_events = vec![];
-        for event in events {
-            match &event {
-                OperationEvent::Read { .. } => {
-                    tcp_events.push(event);
-                }
-                OperationEvent::Write { .. } => {
-                    tcp_events.push(event);
-                }
-
-                OperationEvent::Recv { .. } => {
-                    udp_events.push(event);
-                }
-                OperationEvent::Send { .. } => {
-                    udp_events.push(event);
-                }
-
-                OperationEvent::Ready(typed_handle) => {
-                    self.handle_ready_wake_event(*typed_handle);
-                }
-
-                OperationEvent::Shutdown { .. } => match event {
-                    OperationEvent::Shutdown { handle, result_tx } => {
-                        self.handle_shutdown_event(handle, result_tx);
+        if let Some(Events { events }) = events {
+            let mut tcp_events = vec![];
+            let mut udp_events = vec![];
+            for event in events {
+                match &event {
+                    OperationEvent::Read { .. } => {
+                        tcp_events.push(event);
+                    }
+                    OperationEvent::Write { .. } => {
+                        tcp_events.push(event);
                     }
 
-                    _ => unreachable!(),
-                },
+                    OperationEvent::Recv { .. } => {
+                        udp_events.push(event);
+                    }
+                    OperationEvent::Send { .. } => {
+                        udp_events.push(event);
+                    }
 
-                OperationEvent::Close(typed_handle) => {
-                    self.handle_close_event(*typed_handle);
+                    OperationEvent::Ready(typed_handle) => {
+                        self.handle_ready_wake_event(*typed_handle);
+                    }
+
+                    OperationEvent::Shutdown { .. } => match event {
+                        OperationEvent::Shutdown { handle, result_tx } => {
+                            self.handle_shutdown_event(handle, result_tx);
+                        }
+
+                        _ => unreachable!(),
+                    },
+
+                    OperationEvent::Close(typed_handle) => {
+                        self.handle_close_event(*typed_handle);
+                    }
                 }
+            }
+
+            if !tcp_events.is_empty() {
+                self.handle_tcp_wake_events(tcp_events);
+
+                debug!("handle tcp wake events done");
+            }
+
+            if !udp_events.is_empty() {
+                self.handle_udp_wake_events(udp_events);
+
+                debug!("handle udp wake events done");
             }
         }
 
-        if !tcp_events.is_empty() {
-            self.handle_tcp_wake_events(tcp_events);
-
-            debug!("handle tcp wake events done");
-        }
-
-        if !udp_events.is_empty() {
-            self.handle_udp_wake_events(udp_events);
-
-            debug!("handle udp wake events done");
-        }
-
-        self.process_write_io().await?;
-
-        debug!("process all write io done");
-
         let sleep = self.interface.poll_delay(timestamp, &self.socket_set);
 
-        Ok(sleep.map(Into::into))
+        Ok((
+            self.virtual_iface.pop_all_send_packets(),
+            sleep.map(Into::into),
+        ))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -852,41 +844,6 @@ impl<C: Connection, T: Timer> TcpStack<C, T> {
     }
 
     #[instrument(level = "debug", skip(self), err(Debug))]
-    async fn process_io(&mut self, sleep: Option<Duration>) -> anyhow::Result<()> {
-        if let Some(packet) = self.process_read_io(sleep).await? {
-            if let Some(packet_type) = parse_packet(&packet) {
-                match packet_type {
-                    PacketType::Tcp { src, dst } => {
-                        debug!(%src, %dst, "get new tcp syn packet");
-
-                        self.init_tcp(dst)?;
-
-                        debug!(%src, %dst, "add new listen socket done");
-                    }
-
-                    PacketType::Udp { src, dst } => {
-                        debug!(%src, %dst, "get udp packet");
-
-                        if self.try_init_udp(dst)? {
-                            debug!(%src, %dst, "try init udp done");
-                        }
-                    }
-                }
-            }
-
-            debug!(read_len = packet.len(), "process read io done");
-
-            self.virtual_iface.push_receive_packet(packet);
-        }
-
-        self.process_write_io().await?;
-
-        debug!("process write io done");
-
-        Ok(())
-    }
-
-    #[instrument(level = "debug", skip(self), err(Debug))]
     fn init_tcp(&mut self, dst: SocketAddr) -> anyhow::Result<()> {
         let mut socket = create_tcp_socket(self.tcp_socket_buf_size);
         socket.listen(dst)?;
@@ -922,65 +879,6 @@ impl<C: Connection, T: Timer> TcpStack<C, T> {
             .map_err(|_| anyhow::anyhow!("send udp ready event failed"))?;
 
         Ok(true)
-    }
-
-    #[instrument(level = "debug", skip(self), err(Debug))]
-    async fn process_write_io(&mut self) -> anyhow::Result<()> {
-        while let Some(packet) = self.virtual_iface.pop_send_packet() {
-            self.tun_connection
-                .sink(packet)
-                .await
-                .0
-                .with_context(|| "write packet to tun failed")?;
-        }
-
-        Ok(())
-    }
-
-    #[instrument(level = "debug", skip(self), ret, err(Debug))]
-    async fn process_read_io(&mut self, sleep: Option<Duration>) -> io::Result<Option<BytesMut>> {
-        let events_wait = self.operation_event_rx.wait();
-        let mtu = self.virtual_iface.capabilities().max_transmission_unit;
-        if self.tun_read_buf.capacity() < mtu {
-            self.tun_read_buf
-                .reserve(mtu - self.tun_read_buf.capacity());
-        }
-        let read_buf = self.tun_read_buf.split_off(0);
-
-        let read = self.tun_connection.consume(read_buf);
-        let (res, read_buf) = match sleep {
-            None => {
-                futures_util::select! {
-                    _ = events_wait.fuse() => return Ok(None),
-                    res = read.fuse() => res
-                }
-            }
-
-            Some(delay) => {
-                let sleep_fut = self.timer.sleep(delay);
-                futures_util::select! {
-                    _ = sleep_fut.fuse() => return Ok(None),
-                    _ = events_wait.fuse() => return Ok(None),
-                    res = read.fuse() => res
-                }
-            }
-        };
-
-        match res {
-            Err(err) => {
-                self.tun_read_buf.unsplit(read_buf);
-
-                return Err(err);
-            }
-
-            Ok(n) => {
-                if n == 0 {
-                    return Err(io::Error::new(ErrorKind::BrokenPipe, "tun is broken"));
-                }
-
-                Ok(Some(read_buf))
-            }
-        }
     }
 }
 

@@ -59,7 +59,7 @@ impl UdpSocket {
                     return (
                         Err(io::Error::new(
                             ErrorKind::BrokenPipe,
-                            "TcpStack may be dropped, send read operation event failed",
+                            "TcpStack or EventGenerator may be dropped, send read operation event failed",
                         )),
                         buffer,
                     );
@@ -72,14 +72,14 @@ impl UdpSocket {
         match rx.recv_async().await {
             Err(_) => {
                 // Safety: type is correct, and when recv_async failed, means sender is dropped,
-                // there is only one reason cause it: TcpStack should own the sender, but TcpStack
-                // is dropped
+                // there is only 2 reasons cause it: TcpStack owning the sender, but TcpStack
+                // is dropped, or EventGenerator owning the sender, but EventGenerator is dropped
                 let buf = unsafe { cast_dyn_io_buf_mut(buf) };
 
                 (
                     Err(io::Error::new(
                         ErrorKind::BrokenPipe,
-                        "TcpStack may be dropped, receive read operation response failed",
+                        "TcpStack or EventGenerator may be dropped, receive read operation response failed",
                     )),
                     buf,
                 )
@@ -119,7 +119,7 @@ impl UdpSocket {
                     return (
                         Err(io::Error::new(
                             ErrorKind::BrokenPipe,
-                            "TcpStack may be dropped, send write operation event failed",
+                            "TcpStack or EventGenerator may be dropped, send write operation event failed",
                         )),
                         buffer,
                     );
@@ -132,14 +132,14 @@ impl UdpSocket {
         match rx.recv_async().await {
             Err(_) => {
                 // Safety: type is correct, and when recv_async failed, means sender is dropped,
-                // there is only one reason cause it: TcpStack should own the sender, but TcpStack
-                // is dropped
+                // there is only 2 reasons cause it: TcpStack owning the sender, but TcpStack
+                // is dropped, or EventGenerator owning the sender, but EventGenerator is dropped
                 let buf = unsafe { cast_dyn_io_buf(buf) };
 
                 (
                     Err(io::Error::new(
                         ErrorKind::BrokenPipe,
-                        "TcpStack may be dropped, receive write operation response failed",
+                        "TcpStack or EventGenerator may be dropped, receive write operation response failed",
                     )),
                     buf,
                 )

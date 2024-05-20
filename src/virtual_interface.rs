@@ -24,8 +24,8 @@ impl VirtualInterface {
         self.rx_queue.push_back(packet);
     }
 
-    pub fn pop_send_packet(&mut self) -> Option<Bytes> {
-        self.tx_queue.pop_front()
+    pub fn pop_all_send_packets(&mut self) -> Vec<Bytes> {
+        self.tx_queue.drain(..).collect()
     }
 }
 

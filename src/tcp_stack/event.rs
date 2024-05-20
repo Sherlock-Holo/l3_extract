@@ -2,15 +2,40 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crossbeam_channel::TryRecvError;
 use derivative::Derivative;
 use smoltcp::iface::SocketHandle;
 
 use super::TypedSocketHandle;
+use crate::notify_channel::NotifyReceiver;
 use crate::shared_buf::{AsIoBuf, AsIoBufMut};
+
+#[derive(Debug)]
+pub struct EventGenerator {
+    pub(crate) receiver: NotifyReceiver<OperationEvent>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("generate events failed: {0}")]
+pub struct Error(TryRecvError);
+
+impl EventGenerator {
+    pub async fn generate(&mut self) -> Result<Events, Error> {
+        self.receiver.wait().await;
+        let events = self.receiver.collect_nonblock().map_err(Error)?;
+
+        Ok(Events { events })
+    }
+}
+
+#[derive(Debug)]
+pub struct Events {
+    pub(crate) events: Vec<OperationEvent>,
+}
 
 #[derive(Derivative)]
 #[derivative(Debug)]
-pub enum OperationEvent {
+pub(crate) enum OperationEvent {
     Ready(TypedSocketHandle),
 
     Read {
