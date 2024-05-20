@@ -55,6 +55,11 @@ mod futures_io_wrapper {
             };
 
             let res = self.0.read(uninitiated_buf).await;
+            if let Ok(n) = res {
+                // Safety: we have written n bytes
+                unsafe { buf.set_buf_init(n) }
+            }
+
             (res, buf)
         }
 

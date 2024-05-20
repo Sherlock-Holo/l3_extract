@@ -948,7 +948,7 @@ impl<C: Connection, T: Timer> TcpStack<C, T> {
         let read_buf = self.tun_read_buf.split_off(0);
 
         let read = self.tun_connection.consume(read_buf);
-        let (res, mut read_buf) = match sleep {
+        let (res, read_buf) = match sleep {
             None => {
                 futures_util::select! {
                     _ = events_wait.fuse() => return Ok(None),
@@ -977,9 +977,6 @@ impl<C: Connection, T: Timer> TcpStack<C, T> {
                 if n == 0 {
                     return Err(io::Error::new(ErrorKind::BrokenPipe, "tun is broken"));
                 }
-
-                // Safety: read_buf[..n] is initiated
-                unsafe { read_buf.set_len(n) }
 
                 Ok(Some(read_buf))
             }
