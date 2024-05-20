@@ -2,6 +2,8 @@
 
 use std::io;
 
+use compio_buf::{IoBuf, IoBufMut};
+
 #[cfg(feature = "futures_io_wrapper")]
 #[doc(inline)]
 pub use self::futures_io_wrapper::FuturesIoWrapper;
@@ -18,16 +20,17 @@ pub trait Connection {
     /// # Notes:
     ///
     /// this method **MUST** be cancelable.
-    async fn consume(&mut self, buf: &mut [u8]) -> io::Result<usize>;
+    async fn consume<B: IoBufMut>(&mut self, buf: B) -> (io::Result<usize>, B);
 
     /// Sink a layer 3 packet to the connection.
-    async fn sink(&mut self, packet: &[u8]) -> io::Result<()>;
+    async fn sink<B: IoBuf>(&mut self, packet: B) -> (io::Result<()>, B);
 }
 
 #[cfg(feature = "futures_io_wrapper")]
 mod futures_io_wrapper {
-    use std::io;
+    use std::{io, slice};
 
+    use compio_buf::{IoBuf, IoBufMut};
     use futures_util::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     use super::Connection;
@@ -41,13 +44,24 @@ mod futures_io_wrapper {
         T: AsyncRead + AsyncWrite + Unpin,
     {
         #[inline]
-        async fn consume(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.0.read(buf).await
+        async fn consume<B: IoBufMut>(&mut self, mut buf: B) -> (io::Result<usize>, B) {
+            let uninitiated_buf = buf.as_mut_slice();
+            // Safety: most AsyncRead implement won't read the buffer
+            let uninitiated_buf = unsafe {
+                slice::from_raw_parts_mut(
+                    uninitiated_buf.as_mut_ptr().cast(),
+                    uninitiated_buf.len(),
+                )
+            };
+
+            let res = self.0.read(uninitiated_buf).await;
+            (res, buf)
         }
 
         #[inline]
-        async fn sink(&mut self, packet: &[u8]) -> io::Result<()> {
-            self.0.write(packet).await.map(|_| ())
+        async fn sink<B: IoBuf>(&mut self, packet: B) -> (io::Result<()>, B) {
+            let res = self.0.write(packet.as_slice()).await;
+            (res.map(|_| ()), packet)
         }
     }
 }

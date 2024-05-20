@@ -20,8 +20,8 @@ impl VirtualInterface {
         }
     }
 
-    pub fn push_receive_packet(&mut self, packet: &[u8]) {
-        self.rx_queue.push_back(BytesMut::from(packet));
+    pub fn push_receive_packet(&mut self, packet: BytesMut) {
+        self.rx_queue.push_back(packet);
     }
 
     pub fn pop_send_packet(&mut self) -> Option<Bytes> {

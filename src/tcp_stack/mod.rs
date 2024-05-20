@@ -8,12 +8,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use bytes::BytesMut;
 use compio_buf::{IoBuf, IoBufMut};
 use crossbeam_channel::SendError;
 use flume::Sender;
 use futures_util::FutureExt;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::{ChecksumCapabilities, DeviceCapabilities, Medium};
+use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp::{RecvError, Socket as TcpSocket, SocketBuffer};
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket};
 use smoltcp::time::Instant;
@@ -79,6 +80,8 @@ pub struct TcpStackBuilder {
 
     mtu: Option<usize>,
 
+    tcp_socket_buf_size: Option<usize>,
+
     checksum_capabilities: Option<ChecksumCapabilities>,
 }
 
@@ -110,6 +113,12 @@ impl TcpStackBuilder {
     /// Set MTU, default is 1500.
     pub fn mtu(&mut self, mtu: usize) -> &mut Self {
         self.mtu = Some(mtu);
+        self
+    }
+
+    /// Set TCP socket buffer size
+    pub fn tcp_socket_buf_size(&mut self, socket_buf_size: usize) -> &mut Self {
+        self.tcp_socket_buf_size = Some(socket_buf_size);
         self
     }
 
@@ -153,6 +162,7 @@ impl TcpStackBuilder {
             timer,
             ipv4,
             ipv6,
+            self.tcp_socket_buf_size,
             self.mtu,
             self.checksum_capabilities.clone(),
         )
@@ -167,8 +177,10 @@ pub struct TcpStack<C, T> {
     ipv6_addr: Option<Ipv6Addr>,
     ipv6_gateway: Option<Ipv6Addr>,
 
+    tcp_socket_buf_size: usize,
+
     tun_connection: C,
-    tun_read_buf: Vec<u8>,
+    tun_read_buf: BytesMut,
 
     timer: T,
 
@@ -227,6 +239,7 @@ impl<C, T> TcpStack<C, T> {
         timer: T,
         ipv4: Option<(Ipv4Cidr, Ipv4Addr)>,
         ipv6: Option<(Ipv6Cidr, Ipv6Addr)>,
+        tcp_socket_buf_size: Option<usize>,
         mtu: Option<usize>,
         checksum_capabilities: Option<ChecksumCapabilities>,
     ) -> anyhow::Result<(Self, TcpAcceptor, UdpAcceptor)> {
@@ -270,8 +283,9 @@ impl<C, T> TcpStack<C, T> {
             ipv4_gateway: ipv4.map(|(_, gateway)| gateway),
             ipv6_addr: ipv6.map(|(addr, _)| addr.address().into()),
             ipv6_gateway: ipv6.map(|(_, gateway)| gateway),
+            tcp_socket_buf_size: tcp_socket_buf_size.unwrap_or(SOCKET_BUF_SIZE),
             tun_connection: connection,
-            tun_read_buf: vec![0; mtu],
+            tun_read_buf: BytesMut::with_capacity(mtu),
             timer,
             interface,
             virtual_iface,
@@ -602,14 +616,11 @@ impl<C: Connection, T: Timer> TcpStack<C, T> {
                 }
 
                 let socket = self.socket_set.get_mut::<TcpSocket>(handle);
-                if !socket.can_recv() {
+                if socket.recv_queue() == 0 {
                     if !socket.may_recv() {
                         drop(buffer);
 
-                        let _ = result_tx.send(Err(io::Error::new(
-                            ErrorKind::BrokenPipe,
-                            format!("TCP recv failed, socket state: {}", socket.state()),
-                        )));
+                        let _ = result_tx.send(Ok(0));
                     } else {
                         let tx = self.operation_event_tx.clone();
                         socket.register_recv_waker(&wake_once_fn(move || {
@@ -842,11 +853,8 @@ impl<C: Connection, T: Timer> TcpStack<C, T> {
 
     #[instrument(level = "debug", skip(self), err(Debug))]
     async fn process_io(&mut self, sleep: Option<Duration>) -> anyhow::Result<()> {
-        if let Some(n) = self.process_read_io(sleep).await? {
-            let buf = &self.tun_read_buf[..n];
-            self.virtual_iface.push_receive_packet(buf);
-
-            if let Some(packet_type) = parse_packet(buf) {
+        if let Some(packet) = self.process_read_io(sleep).await? {
+            if let Some(packet_type) = parse_packet(&packet) {
                 match packet_type {
                     PacketType::Tcp { src, dst } => {
                         debug!(%src, %dst, "get new tcp syn packet");
@@ -866,7 +874,9 @@ impl<C: Connection, T: Timer> TcpStack<C, T> {
                 }
             }
 
-            debug!(n, "process read io done");
+            debug!(read_len = packet.len(), "process read io done");
+
+            self.virtual_iface.push_receive_packet(packet);
         }
 
         self.process_write_io().await?;
@@ -878,7 +888,7 @@ impl<C: Connection, T: Timer> TcpStack<C, T> {
 
     #[instrument(level = "debug", skip(self), err(Debug))]
     fn init_tcp(&mut self, dst: SocketAddr) -> anyhow::Result<()> {
-        let mut socket = create_tcp_socket(SOCKET_BUF_SIZE);
+        let mut socket = create_tcp_socket(self.tcp_socket_buf_size);
         socket.listen(dst)?;
         let handle = self.socket_set.add(socket);
         self.socket_handles.insert(TypedSocketHandle::Tcp(handle));
@@ -918,8 +928,9 @@ impl<C: Connection, T: Timer> TcpStack<C, T> {
     async fn process_write_io(&mut self) -> anyhow::Result<()> {
         while let Some(packet) = self.virtual_iface.pop_send_packet() {
             self.tun_connection
-                .sink(&packet)
+                .sink(packet)
                 .await
+                .0
                 .with_context(|| "write packet to tun failed")?;
         }
 
@@ -927,14 +938,21 @@ impl<C: Connection, T: Timer> TcpStack<C, T> {
     }
 
     #[instrument(level = "debug", skip(self), ret, err(Debug))]
-    async fn process_read_io(&mut self, sleep: Option<Duration>) -> anyhow::Result<Option<usize>> {
+    async fn process_read_io(&mut self, sleep: Option<Duration>) -> io::Result<Option<BytesMut>> {
         let events_wait = self.operation_event_rx.wait();
-        let read = self.tun_connection.consume(&mut self.tun_read_buf);
-        let n = match sleep {
+        let mtu = self.virtual_iface.capabilities().max_transmission_unit;
+        if self.tun_read_buf.capacity() < mtu {
+            self.tun_read_buf
+                .reserve(mtu - self.tun_read_buf.capacity());
+        }
+        let read_buf = self.tun_read_buf.split_off(0);
+
+        let read = self.tun_connection.consume(read_buf);
+        let (res, mut read_buf) = match sleep {
             None => {
                 futures_util::select! {
                     _ = events_wait.fuse() => return Ok(None),
-                    res = read.fuse() => res?
+                    res = read.fuse() => res
                 }
             }
 
@@ -943,15 +961,29 @@ impl<C: Connection, T: Timer> TcpStack<C, T> {
                 futures_util::select! {
                     _ = sleep_fut.fuse() => return Ok(None),
                     _ = events_wait.fuse() => return Ok(None),
-                    res = read.fuse() => res?
+                    res = read.fuse() => res
                 }
             }
         };
-        if n == 0 {
-            return Err(anyhow::anyhow!("tun is broken"));
-        }
 
-        Ok(Some(n))
+        match res {
+            Err(err) => {
+                self.tun_read_buf.unsplit(read_buf);
+
+                return Err(err);
+            }
+
+            Ok(n) => {
+                if n == 0 {
+                    return Err(io::Error::new(ErrorKind::BrokenPipe, "tun is broken"));
+                }
+
+                // Safety: read_buf[..n] is initiated
+                unsafe { read_buf.set_len(n) }
+
+                Ok(Some(read_buf))
+            }
+        }
     }
 }
 
