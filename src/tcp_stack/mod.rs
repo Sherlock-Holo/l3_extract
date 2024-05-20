@@ -38,7 +38,7 @@ mod event;
 pub mod tcp;
 pub mod udp;
 
-const SOCKET_BUF_SIZE: usize = 16 * 1024;
+const SOCKET_BUF_SIZE: usize = 128 * 1024;
 const MTU: usize = 1500;
 
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Hash)]
