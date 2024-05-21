@@ -284,7 +284,7 @@ impl TcpStack {
         &mut self,
         packet: Option<BytesMut>,
         events: Option<Events>,
-    ) -> anyhow::Result<(impl IntoIterator<Item = Bytes>, Option<Duration>)> {
+    ) -> anyhow::Result<(impl IntoIterator<Item = Bytes> + '_, Option<Duration>)> {
         if let Some(packet) = packet {
             if let Some(packet_type) = parse_packet(&packet) {
                 match packet_type {
