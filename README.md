@@ -27,14 +27,24 @@ use futures_util::{AsyncRead, AsyncWrite, StreamExt, TryStreamExt};
 use futures_util::stream::FuturesUnordered;
 use futures_util::task::SpawnExt;
 use smoltcp::wire::Ipv4Cidr;
-use l3_extract::TcpStack;
+use l3_extract::{Connection, TcpStack, Timer};
+use futures_timer::Delay;
+
+#[derive(Default)]
+struct MyTimer;
+
+impl Timer for MyTimer {
+    async fn sleep(&mut self, dur: Duration) {
+        Delay::new(dur).await
+    }
+}
 
 async fn run() {
     let connection = create_layer3_connection();
     let (mut tcp_stack, mut tcp_acceptor, mut udp_acceptor) = TcpStack::builder()
         .ipv4_addr(Ipv4Cidr::from_str("192.168.100.10/24").unwrap())
         .ipv4_gateway(Ipv4Addr::new(192, 168, 100, 1))
-        .build(connection).unwrap();
+        .build(connection, MyTimer::default()).unwrap();
     let mut futs = FuturesUnordered::new();
     futs.spawn(async {
         tcp_stack.run().await.unwrap()
@@ -51,7 +61,7 @@ async fn run() {
     futs.collect::<Vec<_>>().await;
 }
 
-async fn create_layer3_connection() -> impl AsyncRead + AsyncWrite + Unpin {
+async fn create_layer3_connection() -> impl Connection {
     // create a layer3 connection
 }
 ```

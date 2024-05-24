@@ -1,571 +1,268 @@
-//! TCP utility types
+//! TCP utility types.
 
-use std::cell::UnsafeCell;
-use std::io::{ErrorKind, IoSlice, IoSliceMut};
+use std::io;
+use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
-use std::{io, mem};
 
-use bytes::{Buf, BytesMut};
-use crossbeam_channel::{Receiver, TryRecvError};
+use compio_buf::{IntoInner, IoBuf, IoBufMut};
+use crossbeam_channel::SendError;
 use derivative::Derivative;
 use flume::r#async::RecvStream;
-use futures_util::task::AtomicWaker;
-use futures_util::{AsyncBufRead, AsyncRead, AsyncWrite, Stream, StreamExt};
+use futures_util::{Stream, StreamExt};
 use smoltcp::iface::SocketHandle;
-use tracing::error;
 
-use super::wake_event::{
-    CloseEvent, ReadPoll, ReadWakeEvent, ShutdownEvent, WakeEvent, WritePoll, WriteWakeEvent,
-};
-use super::{create_share_waker, TcpInfo, TypedSocketHandle};
+use super::event::OperationEvent;
+use super::{cast_dyn_io_buf, cast_dyn_io_buf_mut, TcpInfo, TypedSocketHandle};
 use crate::notify_channel::NotifySender;
+use crate::shared_buf::{AsIoBuf, AsIoBufMut, SharedBuf};
 
-#[derive(Derivative)]
-#[derivative(Debug)]
-enum ReadState {
-    Buffer(#[derivative(Debug = "ignore")] BytesMut),
-    WaitResult(Receiver<ReadPoll>),
-}
-
-#[derive(Derivative)]
-#[derivative(Debug)]
-enum WriteState {
-    Buffer(#[derivative(Debug = "ignore")] BytesMut),
-    Flushing(Receiver<WritePoll>),
-}
-
-#[derive(Debug)]
-enum CloseState {
-    Opened,
-    Closing(Receiver<Poll<io::Result<()>>>),
-    Closed,
-}
-
-/// A TCP stream, like tokio/async-net TcpStream
+/// A TCP stream, like tokio/async-net TcpStream.
 ///
 /// This TCP stream doesn't like normal [`std::net::TcpStream`] which accepted by
-/// [`std::net::TcpListener`], it is a **client** side TCP stream
-///
-/// ## Notes
-///
-/// You must call [flush](futures_util::AsyncWriteExt::flush) to make sure data is written to peer
+/// [`std::net::TcpListener`], it is a **client** side TCP stream.
 #[derive(Debug)]
 pub struct TcpStream {
-    read_eof: bool,
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
     handle: SocketHandle,
-    wake_event_tx: NotifySender<WakeEvent>,
-
-    read_buf_cap: usize,
-    read_state: ReadState,
-    read_waker: Arc<AtomicWaker>,
-
-    write_buf_cap: usize,
-    write_state: WriteState,
-    write_waker: Arc<AtomicWaker>,
-
-    close_state: CloseState,
-    close_waker: Arc<AtomicWaker>,
+    operation_event_tx: NotifySender<OperationEvent>,
 }
 
 impl TcpStream {
-    /// Get local socket addr
+    /// Get local socket addr.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
-    /// Get peer socket addr
+    /// Get peer socket addr.
     pub fn peer_addr(&self) -> SocketAddr {
         self.remote_addr
     }
 
-    /// Split a [`TcpStream`] into two halves: [`ReadHalf`] and [`WriteHalf`]
-    pub fn split(self) -> (ReadHalf, WriteHalf) {
-        let tcp_stream = Arc::new(SendSyncUnsafeCellTcpStream(UnsafeCell::new(self)));
+    /// Pull some bytes from this [`TcpStream`] into the specified buffer, returning how many bytes
+    /// were read and the buffer itself.
+    pub async fn read<T: IoBufMut + Send + Sync>(&self, buf: T) -> (io::Result<usize>, T) {
+        let buf = Arc::new(SharedBuf::new(buf)) as Arc<dyn AsIoBufMut>;
+        let (tx, rx) = flume::bounded(1);
+        if let Err(SendError(event)) = self.operation_event_tx.send(OperationEvent::Read {
+            handle: self.handle,
+            buffer: buf.clone(),
+            result_tx: tx,
+        }) {
+            match event {
+                OperationEvent::Read { buffer, .. } => {
+                    // make sure buffer ref count is 1
+                    drop(buf);
 
-        (
-            ReadHalf {
-                tcp_stream: tcp_stream.clone(),
-            },
-            WriteHalf { tcp_stream },
-        )
-    }
+                    // Safety: type is correct
+                    let buffer = unsafe { cast_dyn_io_buf_mut(buffer) };
 
-    fn inner_poll_fill_buf(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
-        if self.read_eof && matches!(self.close_state, CloseState::Closed) {
-            return Poll::Ready(Ok(&[]));
-        }
-
-        match &self.read_state {
-            ReadState::Buffer(buf) => {
-                if !buf.is_empty() {
-                    // Safety: without the mem::transmute, it can pass polonius borrow checker but
-                    // fail with NLL
-                    let buf = unsafe { mem::transmute::<&[u8], &[u8]>(buf.as_ref()) };
-
-                    return Poll::Ready(Ok(buf));
-                }
-
-                let (tx, rx) = crossbeam_channel::bounded(1);
-                let read_state = mem::replace(&mut self.read_state, ReadState::WaitResult(rx));
-                let buf = match read_state {
-                    ReadState::Buffer(buf) => buf,
-                    _ => unreachable!(),
-                };
-
-                self.read_waker.register(cx.waker());
-                if self
-                    .wake_event_tx
-                    .send(WakeEvent::Read(ReadWakeEvent {
-                        handle: TypedSocketHandle::Tcp(self.handle),
-                        buffer: buf,
-                        waker: create_share_waker(self.read_waker.clone()),
-                        respond: tx,
-                    }))
-                    .is_err()
-                {
-                    error!("TcpStack may be dropped, send wake event failed");
-
-                    return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)));
-                }
-
-                Poll::Pending
-            }
-
-            ReadState::WaitResult(rx) => {
-                self.read_waker.register(cx.waker());
-
-                let read_poll = match rx.try_recv() {
-                    Err(TryRecvError::Empty) => return Poll::Pending,
-                    Err(TryRecvError::Disconnected) => {
-                        error!("TcpStack may be dropped, try receive wake event response failed");
-
-                        return Poll::Ready(Err(io::Error::new(
+                    return (
+                        Err(io::Error::new(
                             ErrorKind::BrokenPipe,
-                            "TcpStack may be dropped, try receive wake event response failed",
-                        )));
-                    }
-                    Ok(read_poll) => read_poll,
-                };
-
-                match read_poll {
-                    ReadPoll::Pending(buf) => {
-                        self.read_state = ReadState::Buffer(buf);
-
-                        // tcp stack wake but in earlier tcp socket not ready, so we need to poll
-                        // fill buf again
-                        self.inner_poll_fill_buf(cx)
-                    }
-
-                    ReadPoll::Ready { buf, result } => {
-                        let eof = buf.is_empty();
-                        self.read_state = ReadState::Buffer(buf);
-
-                        result?;
-                        self.read_eof = eof;
-
-                        self.inner_poll_fill_buf(cx)
-                    }
-                }
-            }
-        }
-    }
-
-    fn is_close_write(&self) -> bool {
-        matches!(
-            self.close_state,
-            CloseState::Closed | CloseState::Closing(_)
-        )
-    }
-}
-
-impl AsyncRead for TcpStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-
-        let inner_buf = ready!(self.as_mut().poll_fill_buf(cx))?;
-        if inner_buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-
-        let n = inner_buf.len().min(buf.len());
-        buf[..n].copy_from_slice(&inner_buf[..n]);
-        self.consume(n);
-
-        Poll::Ready(Ok(n))
-    }
-}
-
-impl AsyncBufRead for TcpStream {
-    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
-        self.get_mut().inner_poll_fill_buf(cx)
-    }
-
-    fn consume(mut self: Pin<&mut Self>, amt: usize) {
-        let cap = self.read_buf_cap;
-        match &mut self.read_state {
-            ReadState::Buffer(buf) => {
-                buf.advance(amt);
-                if !buf.has_remaining() {
-                    buf.reserve(cap);
-                }
-            }
-            ReadState::WaitResult(_) => {
-                panic!("TcpStream is not ready for read")
-            }
-        }
-    }
-}
-
-impl AsyncWrite for TcpStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        if self.is_close_write() {
-            return Poll::Ready(Err(io::Error::new(
-                ErrorKind::BrokenPipe,
-                "TcpStream is closed",
-            )));
-        }
-
-        match &mut self.write_state {
-            WriteState::Buffer(inner_buf) => {
-                let available_write_size = inner_buf.capacity() - inner_buf.len();
-                let need_flush = available_write_size < buf.len();
-                let n = available_write_size.min(buf.len());
-                inner_buf.extend_from_slice(&buf[..n]);
-
-                if !need_flush {
-                    return Poll::Ready(Ok(n));
+                            "TcpStack or EventGenerator may be dropped, send read operation event failed",
+                        )),
+                        buffer,
+                    );
                 }
 
-                match self.as_mut().poll_flush(cx) {
-                    Poll::Pending => {
-                        if n > 0 {
-                            Poll::Ready(Ok(n))
-                        } else {
-                            Poll::Pending
-                        }
-                    }
-
-                    Poll::Ready(res) => {
-                        res?;
-
-                        if n > 0 {
-                            Poll::Ready(Ok(n))
-                        } else {
-                            self.poll_write(cx, buf)
-                        }
-                    }
-                }
-            }
-
-            WriteState::Flushing(_) => {
-                ready!(self.as_mut().poll_flush(cx))?;
-
-                self.poll_write(cx, buf)
+                _ => unreachable!(),
             }
         }
-    }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.is_close_write() {
-            return Poll::Ready(Err(io::Error::new(
-                ErrorKind::BrokenPipe,
-                "TcpStream is closed",
-            )));
-        }
+        match rx.recv_async().await {
+            Err(_) => {
+                // Safety: type is correct, and when recv_async failed, means sender is dropped,
+                // there is only 2 reasons cause it: TcpStack owning the sender, but TcpStack
+                // is dropped, or EventGenerator owning the sender, but EventGenerator is dropped
+                let buf = unsafe { cast_dyn_io_buf_mut(buf) };
 
-        match &self.write_state {
-            WriteState::Flushing(rx) => {
-                self.write_waker.register(cx.waker());
-
-                let write_poll = match rx.try_recv() {
-                    Err(TryRecvError::Empty) => return Poll::Pending,
-                    Err(TryRecvError::Disconnected) => {
-                        error!("TcpStack may be dropped, try receive wake event response failed");
-
-                        return Poll::Ready(Err(io::Error::new(
-                            ErrorKind::BrokenPipe,
-                            "TcpStack may be dropped, try receive wake event response failed",
-                        )));
-                    }
-                    Ok(write_poll) => write_poll,
-                };
-
-                match write_poll {
-                    WritePoll::Pending(buf) => {
-                        self.write_state = WriteState::Buffer(buf);
-
-                        // tcp stack wake but in earlier tcp socket not ready, so we need to poll
-                        // flush again
-                        self.poll_flush(cx)
-                    }
-
-                    WritePoll::Ready { mut buf, result } => {
-                        let has_remaining = buf.has_remaining();
-                        if !has_remaining {
-                            buf.reserve(self.write_buf_cap);
-                        }
-                        self.write_state = WriteState::Buffer(buf);
-                        result?;
-
-                        // still need continue flush to write all buffer data
-                        if has_remaining {
-                            self.poll_flush(cx)
-                        } else {
-                            Poll::Ready(Ok(()))
-                        }
-                    }
-                }
-            }
-
-            WriteState::Buffer(buf) => {
-                if buf.is_empty() {
-                    return Poll::Ready(Ok(()));
-                }
-
-                let (tx, rx) = crossbeam_channel::bounded(1);
-                let write_state = mem::replace(&mut self.write_state, WriteState::Flushing(rx));
-                let buf = match write_state {
-                    WriteState::Buffer(buf) => buf,
-                    _ => unreachable!(),
-                };
-
-                self.write_waker.register(cx.waker());
-                if self
-                    .wake_event_tx
-                    .send(WakeEvent::Write(WriteWakeEvent {
-                        handle: TypedSocketHandle::Tcp(self.handle),
-                        data: buf,
-                        waker: create_share_waker(self.write_waker.clone()),
-                        respond: tx,
-                    }))
-                    .is_err()
-                {
-                    error!("TcpStack may be dropped, send wake event failed");
-
-                    return Poll::Ready(Err(io::Error::new(
+                (
+                    Err(io::Error::new(
                         ErrorKind::BrokenPipe,
-                        "TcpStack may be dropped, send wake event failed",
-                    )));
-                }
+                        "TcpStack or EventGenerator may be dropped, receive read operation response failed",
+                    )),
+                    buf,
+                )
+            }
 
-                Poll::Pending
+            Ok(res) => {
+                // Safety: type is correct
+                let buf = unsafe { cast_dyn_io_buf_mut(buf) };
+
+                (res, buf)
             }
         }
     }
 
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match &self.close_state {
-            CloseState::Opened => {
-                let (tx, rx) = crossbeam_channel::bounded(1);
-                self.close_waker.register(cx.waker());
-                if self
-                    .wake_event_tx
-                    .send(WakeEvent::Shutdown(ShutdownEvent {
-                        handle: TypedSocketHandle::Tcp(self.handle),
-                        waker: create_share_waker(self.close_waker.clone()),
-                        respond: tx,
-                    }))
-                    .is_err()
-                {
-                    error!("TcpStack may be dropped, send wake event failed");
+    /// Read the exact number of bytes required to fill `buf`.
+    ///
+    /// This function reads as many bytes as necessary to completely fill the specified buffer
+    /// `buf`.
+    pub async fn read_exact<T: IoBufMut + Send + Sync>(&self, mut buf: T) -> (io::Result<()>, T) {
+        let mut read = 0;
+        let len = buf.buf_capacity();
 
-                    return Poll::Ready(Err(io::Error::new(
-                        ErrorKind::BrokenPipe,
-                        "TcpStack may be dropped, send wake event failed",
-                    )));
+        while read < len {
+            let (res, slice) = self.read(buf.slice(read..)).await;
+            match res {
+                Err(err) => return (Err(err), slice.into_inner()),
+                Ok(0) => {
+                    return (
+                        Err(io::Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "failed to fill whole buffer",
+                        )),
+                        slice.into_inner(),
+                    );
                 }
-
-                self.close_state = CloseState::Closing(rx);
-
-                Poll::Pending
+                Ok(n) => {
+                    buf = slice.into_inner();
+                    read += n;
+                }
             }
+        }
 
-            CloseState::Closing(rx) => {
-                self.close_waker.register(cx.waker());
+        (Ok(()), buf)
+    }
 
-                match rx.try_recv() {
-                    Err(TryRecvError::Empty) => Poll::Pending,
-                    Err(TryRecvError::Disconnected) => {
-                        error!("TcpStack may be dropped, try receive wake event response failed");
+    /// Write a buffer into this [`TcpStream`], returning how many bytes were written and buffer
+    /// itself.
+    pub async fn write<T: IoBuf + Send + Sync>(&self, buf: T) -> (io::Result<usize>, T) {
+        let buf = Arc::new(SharedBuf::new(buf)) as Arc<dyn AsIoBuf>;
+        let (tx, rx) = flume::bounded(1);
+        if let Err(SendError(event)) = self.operation_event_tx.send(OperationEvent::Write {
+            handle: self.handle,
+            buffer: buf.clone(),
+            result_tx: tx,
+        }) {
+            match event {
+                OperationEvent::Write { buffer, .. } => {
+                    // make sure buffer ref count is 1
+                    drop(buf);
 
-                        Poll::Ready(Err(io::Error::new(
+                    // Safety: type is correct
+                    let buffer = unsafe { cast_dyn_io_buf(buffer) };
+
+                    return (
+                        Err(io::Error::new(
                             ErrorKind::BrokenPipe,
-                            "TcpStack may be dropped, try receive wake event response failed",
-                        )))
-                    }
-
-                    Ok(poll) => match poll {
-                        Poll::Ready(res) => {
-                            self.close_state = CloseState::Closed;
-
-                            Poll::Ready(res)
-                        }
-
-                        Poll::Pending => {
-                            // tcp stack wake but in earlier tcp socket not ready, so we need
-                            // to poll close again
-                            self.poll_close(cx)
-                        }
-                    },
+                            "TcpStack or EventGenerator may be dropped, send write operation event failed",
+                        )),
+                        buffer,
+                    );
                 }
+
+                _ => unreachable!(),
+            }
+        }
+
+        match rx.recv_async().await {
+            Err(_) => {
+                // Safety: type is correct, and when recv_async failed, means sender is dropped,
+                // there is only 2 reasons cause it: TcpStack owning the sender, but TcpStack
+                // is dropped, or EventGenerator owning the sender, but EventGenerator is dropped
+                let buf = unsafe { cast_dyn_io_buf(buf) };
+
+                (
+                    Err(io::Error::new(
+                        ErrorKind::BrokenPipe,
+                        "TcpStack or EventGenerator may be dropped, receive write operation response failed",
+                    )),
+                    buf,
+                )
             }
 
-            CloseState::Closed => Poll::Ready(Ok(())),
+            Ok(res) => {
+                // Safety: type is correct
+                let buf = unsafe { cast_dyn_io_buf(buf) };
+
+                (res, buf)
+            }
+        }
+    }
+
+    /// Attempts to write an entire buffer into this writer.
+    ///
+    /// This method will continuously call [write] until there is no more data to be written.
+    ///
+    /// [write]: Self::write
+    pub async fn write_all<T: IoBuf + Send + Sync>(&self, mut buf: T) -> (io::Result<()>, T) {
+        let mut written = 0;
+        let len = buf.buf_len();
+
+        while written < len {
+            let (res, slice) = self.write(buf.slice(written..)).await;
+            match res {
+                Err(err) => return (Err(err), slice.into_inner()),
+                Ok(0) => {
+                    return (
+                        Err(io::Error::new(
+                            ErrorKind::WriteZero,
+                            "failed to write whole buffer",
+                        )),
+                        slice.into_inner(),
+                    );
+                }
+                Ok(n) => {
+                    written += n;
+                    buf = slice.into_inner();
+                }
+            }
+        }
+
+        (Ok(()), buf)
+    }
+
+    /// Shuts down the write halves of this connection.
+    pub async fn shutdown(&self) -> io::Result<()> {
+        let (tx, rx) = flume::bounded(1);
+        if let Err(SendError(event)) = self.operation_event_tx.send(OperationEvent::Shutdown {
+            handle: TypedSocketHandle::Tcp(self.handle),
+            result_tx: tx,
+        }) {
+            match event {
+                OperationEvent::Shutdown { .. } => {
+                    return Err(io::Error::new(
+                        ErrorKind::BrokenPipe,
+                        "TcpStack or EventGenerator may be dropped, send shutdown operation event failed",
+                    ));
+                }
+
+                _ => unreachable!(),
+            }
+        }
+
+        match rx.recv_async().await {
+            Err(_) => Err(io::Error::new(
+                ErrorKind::BrokenPipe,
+                "TcpStack or EventGenerator may be dropped, receive shutdown operation response failed",
+            )),
+
+            Ok(res) => res,
         }
     }
 }
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        let _ = self.wake_event_tx.send(WakeEvent::Close(CloseEvent {
-            handle: TypedSocketHandle::Tcp(self.handle),
-        }));
-    }
-}
-
-#[repr(transparent)]
-struct SendSyncUnsafeCellTcpStream(UnsafeCell<TcpStream>);
-
-// Safety: TcpStream is Sync and Send, and we don't have data race
-unsafe impl Send for SendSyncUnsafeCellTcpStream {}
-
-unsafe impl Sync for SendSyncUnsafeCellTcpStream {}
-
-impl Deref for SendSyncUnsafeCellTcpStream {
-    type Target = UnsafeCell<TcpStream>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for SendSyncUnsafeCellTcpStream {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-/// The readable half of a [`TcpStream`]
-pub struct ReadHalf {
-    tcp_stream: Arc<SendSyncUnsafeCellTcpStream>,
-}
-
-impl ReadHalf {
-    /// Attempts to put the two “halves” of a split [`TcpStream`] back together.
-    pub fn reunite(self, write_half: WriteHalf) -> Result<TcpStream, (Self, WriteHalf)> {
-        if Arc::ptr_eq(&self.tcp_stream, &write_half.tcp_stream) {
-            drop(write_half);
-
-            Ok(Arc::into_inner(self.tcp_stream)
-                .expect("there are other Arc<UnsafeCell<TcpStream>> but that should not happened")
-                .0
-                .into_inner())
-        } else {
-            Err((self, write_half))
-        }
-    }
-
-    fn pin_mut_tcp_stream(self: Pin<&mut Self>) -> Pin<&mut TcpStream> {
-        // Safety: ReadHalf::poll_read require Pin<&mut Self>, and it won't use WriteHalf data and
-        // other fields only use ref not mut ref
-        let tcp_stream = unsafe { &mut *self.tcp_stream.get() };
-        Pin::new(tcp_stream)
-    }
-}
-
-impl AsyncRead for ReadHalf {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        self.pin_mut_tcp_stream().poll_read(cx, buf)
-    }
-
-    fn poll_read_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &mut [IoSliceMut<'_>],
-    ) -> Poll<io::Result<usize>> {
-        self.pin_mut_tcp_stream().poll_read_vectored(cx, bufs)
-    }
-}
-
-impl AsyncBufRead for ReadHalf {
-    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
-        self.pin_mut_tcp_stream().poll_fill_buf(cx)
-    }
-
-    fn consume(self: Pin<&mut Self>, amt: usize) {
-        self.pin_mut_tcp_stream().consume(amt)
-    }
-}
-
-/// The writeable half of a [`TcpStream`]
-pub struct WriteHalf {
-    tcp_stream: Arc<SendSyncUnsafeCellTcpStream>,
-}
-
-impl WriteHalf {
-    fn pin_mut_tcp_stream(self: Pin<&mut Self>) -> Pin<&mut TcpStream> {
-        // Safety: WriteHalf::poll_write require Pin<&mut Self>, and it won't use ReadHalf data and
-        // other fields only use ref not mut ref
-        let tcp_stream = unsafe { &mut *self.tcp_stream.get() };
-        Pin::new(tcp_stream)
-    }
-}
-
-impl AsyncWrite for WriteHalf {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        self.pin_mut_tcp_stream().poll_write(cx, buf)
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        self.pin_mut_tcp_stream().poll_write_vectored(cx, bufs)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.pin_mut_tcp_stream().poll_flush(cx)
-    }
-
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.pin_mut_tcp_stream().poll_close(cx)
+        let _ = self
+            .operation_event_tx
+            .send(OperationEvent::Close(TypedSocketHandle::Tcp(self.handle)));
     }
 }
 
 /// A TCP socket acceptor, like [`std::net::TcpListener`], but you will accept a client side TCP
-/// stream, not server side
+/// stream, not server side.
 #[derive(Derivative)]
 #[derivative(Debug)]
 pub struct TcpAcceptor {
     #[derivative(Debug = "ignore")]
     pub(crate) tcp_stream_rx: RecvStream<'static, io::Result<TcpInfo>>,
-    pub(crate) wake_event_tx: NotifySender<WakeEvent>,
-    pub(crate) buf_cap: usize,
+    pub(crate) operation_event_tx: NotifySender<OperationEvent>,
 }
 
 impl Stream for TcpAcceptor {
@@ -576,19 +273,10 @@ impl Stream for TcpAcceptor {
         match res {
             None => Poll::Ready(None),
             Some(tcp_info) => Poll::Ready(Some(Ok(TcpStream {
-                read_eof: false,
                 local_addr: tcp_info.local_addr,
                 remote_addr: tcp_info.remote_addr,
                 handle: tcp_info.handle,
-                wake_event_tx: self.wake_event_tx.clone(),
-                read_buf_cap: self.buf_cap,
-                read_state: ReadState::Buffer(BytesMut::with_capacity(self.buf_cap)),
-                read_waker: Default::default(),
-                write_buf_cap: self.buf_cap,
-                write_state: WriteState::Buffer(BytesMut::with_capacity(self.buf_cap)),
-                write_waker: Arc::new(Default::default()),
-                close_state: CloseState::Opened,
-                close_waker: Arc::new(Default::default()),
+                operation_event_tx: self.operation_event_tx.clone(),
             }))),
         }
     }

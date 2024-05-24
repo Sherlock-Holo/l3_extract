@@ -1,9 +1,8 @@
 use std::io;
 use std::io::{Error, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::{AsFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::pin::pin;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -16,10 +15,10 @@ use futures_util::future::Either;
 use futures_util::{AsyncReadExt, AsyncWriteExt, TryStreamExt};
 use l3_extract::event::EventGenerator;
 use l3_extract::tcp_stack::TcpStackBuilder;
-use l3_extract::{TcpAcceptor, TcpStack};
+use l3_extract::TcpStack;
 use netlink_sys::SmolSocket;
 use rtnetlink::Handle;
-use smoltcp::wire::{Ipv4Address, Ipv4Cidr, Ipv6Cidr};
+use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
 use tracing::level_filters::LevelFilter;
 use tracing::{info, subscriber};
 use tracing_subscriber::layer::SubscriberExt;
@@ -27,25 +26,21 @@ use tracing_subscriber::{fmt, Registry};
 use tun::Layer;
 
 const IFACE: &str = "echo0";
-const IPV4: Ipv4Cidr = Ipv4Cidr::new(Ipv4Address::new(192, 168, 100, 10), 24);
-const IPV4_GATEWAY: Ipv4Addr = Ipv4Addr::new(192, 168, 100, 1);
+const IP: Ipv4Cidr = Ipv4Cidr::new(Ipv4Address::new(192, 168, 100, 10), 24);
+const GATEWAY: Ipv4Addr = Ipv4Addr::new(192, 168, 100, 1);
 const MTU: usize = 1500;
 
 fn main() {
     async_global_executor::block_on(async {
         init_log();
 
-        let ipv6 = Ipv6Cidr::new(Ipv6Addr::from_str("fc00::10:10").unwrap().into(), 7);
-        let ipv6_gateway = Ipv6Addr::from_str("fc00::10:1").unwrap();
-        let fd = create_tun(IPV4, IPV4_GATEWAY, ipv6, ipv6_gateway).await;
+        let fd = create_tun().await;
 
         info!("create tun done");
 
         let (tcp_stack, event_generator, mut tcp_acceptor, _) = TcpStackBuilder::default()
-            .ipv4_addr(IPV4)
-            .ipv4_gateway(IPV4_GATEWAY)
-            .ipv6_addr(ipv6)
-            .ipv6_gateway(ipv6_gateway)
+            .ipv4_addr(IP)
+            .ipv4_gateway(GATEWAY)
             .mtu(MTU)
             .build()
             .unwrap();
@@ -56,67 +51,24 @@ fn main() {
             task.detach();
         }
 
-        ipv4_echo(&mut tcp_acceptor).await;
-        ipv6_echo(&mut tcp_acceptor).await;
+        let connect_task =
+            async_global_executor::spawn(async { TcpStream::connect("192.168.200.20:80").await });
+
+        let accept_tcp = tcp_acceptor.try_next().await.unwrap().unwrap();
+        let mut connect_tcp = connect_task.await.unwrap();
+
+        info!("connect and accept done");
+
+        connect_tcp.write_all(b"test").await.unwrap();
+        connect_tcp.flush().await.unwrap();
+        let buf = [0; 4];
+        let (res, buf) = accept_tcp.read_exact(buf).await;
+        res.unwrap();
+        assert_eq!(buf.as_slice(), b"test");
+
+        drop(connect_tcp);
+        assert_eq!(accept_tcp.read(buf).await.0.unwrap(), 0);
     });
-}
-
-async fn ipv6_echo(tcp_acceptor: &mut TcpAcceptor) {
-    let connect_task = async_global_executor::spawn(async move {
-        TcpStream::connect(SocketAddr::new(
-            IpAddr::from_str("fc00::20:10").unwrap(),
-            80,
-        ))
-        .await
-    });
-
-    let accept_tcp = tcp_acceptor.try_next().await.unwrap().unwrap();
-    let mut connect_tcp = connect_task.await.unwrap();
-
-    info!("connect and accept done");
-
-    connect_tcp.write_all(b"test").await.unwrap();
-    connect_tcp.flush().await.unwrap();
-    let buf = [0; 4];
-    let (res, mut buf) = accept_tcp.read_exact(buf).await;
-    res.unwrap();
-    assert_eq!(buf.as_slice(), b"test");
-
-    let (res, _) = accept_tcp.write_all(b"test").await;
-    res.unwrap();
-
-    connect_tcp.read_exact(&mut buf).await.unwrap();
-    assert_eq!(buf.as_slice(), b"test");
-
-    // equal shutdown write
-    accept_tcp.shutdown().await.unwrap();
-    assert_eq!(connect_tcp.read(&mut [0; 1]).await.unwrap(), 0);
-}
-
-async fn ipv4_echo(tcp_acceptor: &mut TcpAcceptor) {
-    let connect_task =
-        async_global_executor::spawn(async { TcpStream::connect("192.168.200.20:80").await });
-
-    let accept_tcp = tcp_acceptor.try_next().await.unwrap().unwrap();
-    let mut connect_tcp = connect_task.await.unwrap();
-
-    info!("connect and accept done");
-
-    connect_tcp.write_all(b"test").await.unwrap();
-    connect_tcp.flush().await.unwrap();
-    let buf = [0; 4];
-    let (res, mut buf) = accept_tcp.read_exact(buf).await;
-    res.unwrap();
-    assert_eq!(buf.as_slice(), b"test");
-
-    accept_tcp.write_all(b"test").await.0.unwrap();
-
-    connect_tcp.read_exact(&mut buf).await.unwrap();
-    assert_eq!(buf.as_slice(), b"test");
-
-    // equal shutdown write
-    accept_tcp.shutdown().await.unwrap();
-    assert_eq!(connect_tcp.read(&mut [0; 1]).await.unwrap(), 0);
 }
 
 fn run_stack(
@@ -209,12 +161,7 @@ fn run_stack(
     vec![read_task, write_task, events_task, drive_task]
 }
 
-async fn create_tun(
-    ipv4: Ipv4Cidr,
-    ipv4_gateway: Ipv4Addr,
-    ipv6: Ipv6Cidr,
-    ipv6_gateway: Ipv6Addr,
-) -> Async<SafeFd> {
+async fn create_tun() -> Async<SafeFd> {
     let mut tun_conf = tun::configure();
     tun_conf
         .name(IFACE)
@@ -229,19 +176,12 @@ async fn create_tun(
     let tun_fd = unsafe { OwnedFd::from_raw_fd(tun_fd) };
     let (conn, handle, _) = rtnetlink::new_connection_with_socket::<SmolSocket>().unwrap();
     let _netlink_task = async_global_executor::spawn(conn);
-    init_tun(handle, IFACE, ipv4, ipv4_gateway, ipv6, ipv6_gateway).await;
+    init_tun(handle, IFACE, IP, GATEWAY).await;
 
     Async::new(SafeFd(tun_fd)).unwrap()
 }
 
-async fn init_tun(
-    handle: Handle,
-    iface_name: &str,
-    ipv4: Ipv4Cidr,
-    ipv4_gateway: Ipv4Addr,
-    ipv6: Ipv6Cidr,
-    ipv6_gateway: Ipv6Addr,
-) {
+async fn init_tun(handle: Handle, iface_name: &str, ipv4: Ipv4Cidr, ipv4_gateway: Ipv4Addr) {
     let link_stream = handle
         .link()
         .get()
@@ -267,17 +207,6 @@ async fn init_tun(
         .await
         .unwrap();
 
-    handle
-        .address()
-        .add(
-            link_index,
-            IpAddr::V6(ipv6.address().into()),
-            ipv6.prefix_len(),
-        )
-        .execute()
-        .await
-        .unwrap();
-
     handle.link().set(link_index).up().execute().await.unwrap();
 
     handle
@@ -286,16 +215,6 @@ async fn init_tun(
         .v4()
         .destination_prefix(Ipv4Addr::from([0; 4]), 0)
         .gateway(ipv4_gateway)
-        .execute()
-        .await
-        .unwrap();
-
-    handle
-        .route()
-        .add()
-        .v6()
-        .destination_prefix(Ipv6Addr::UNSPECIFIED, 0)
-        .gateway(ipv6_gateway)
         .execute()
         .await
         .unwrap();

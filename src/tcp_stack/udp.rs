@@ -1,265 +1,176 @@
-//! UDP utility types
+//! UDP utility types.
 
-use std::future::poll_fn;
+use std::io;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
-use std::{io, mem};
 
-use bytes::{Buf, BytesMut};
-use crossbeam_channel::{Receiver, TryRecvError};
+use compio_buf::{IoBuf, IoBufMut};
+use crossbeam_channel::SendError;
 use derivative::Derivative;
 use flume::r#async::RecvStream;
-use futures_util::lock::Mutex;
-use futures_util::task::AtomicWaker;
 use futures_util::{Stream, StreamExt};
 use smoltcp::iface::SocketHandle;
-use tracing::error;
 
-use super::wake_event::{
-    CloseEvent, ReadPoll, ReadWakeEvent, WakeEvent, WritePoll, WriteWakeEvent,
-};
-use super::{create_share_waker, TypedSocketHandle, UdpInfo};
+use super::event::OperationEvent;
+use super::{cast_dyn_io_buf, cast_dyn_io_buf_mut, TypedSocketHandle, UdpInfo};
 use crate::notify_channel::NotifySender;
+use crate::shared_buf::{AsIoBuf, AsIoBufMut, SharedBuf};
 
-#[derive(Derivative)]
-#[derivative(Debug)]
-enum RecvState {
-    Buffer(#[derivative(Debug = "ignore")] BytesMut),
-    WaitResult(Receiver<ReadPoll>),
-}
-
-#[derive(Derivative)]
-#[derivative(Debug)]
-enum SendState {
-    Buffer(#[derivative(Debug = "ignore")] BytesMut),
-    Sending(Receiver<WritePoll>),
-}
-
-/// A UDP socket, like tokio/async-net UdpSocket
+/// A UDP socket, like tokio/async-net UdpSocket.
 ///
-/// This UDP socket is a **client** side UDP socket, like [`std::net::UdpSocket`] which has called
-/// [connect](std::net::UdpSocket::connect)
+/// This UDP socket is a **server** side UDP socket, like [`std::net::UdpSocket`].
 #[derive(Debug)]
 pub struct UdpSocket {
-    local_addr: SocketAddr,
     remote_addr: SocketAddr,
     handle: SocketHandle,
-    send_payload_capacity: usize,
-    wake_event_tx: NotifySender<WakeEvent>,
-
-    read_state: Mutex<RecvState>,
-    read_waker: Arc<AtomicWaker>,
-
-    write_state: Mutex<SendState>,
-    write_waker: Arc<AtomicWaker>,
+    operation_event_tx: NotifySender<OperationEvent>,
 }
 
 impl UdpSocket {
-    /// Get local socket addr
-    pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
-    }
-
-    /// Get peer socket addr
+    /// Get peer socket addr.
     pub fn peer_addr(&self) -> SocketAddr {
         self.remote_addr
     }
 
-    /// Send payload capacity, if send data size is large than that, will return error
-    pub fn send_payload_capacity(&self) -> usize {
-        self.send_payload_capacity
-    }
+    /// Receives a single datagram message on the [`UdpSocket`], and return the `buf` and source
+    /// `addr`.
+    pub async fn recv<T: IoBufMut + Send + Sync>(
+        &self,
+        buf: T,
+    ) -> (io::Result<(usize, SocketAddr)>, T) {
+        let buf = Arc::new(SharedBuf::new(buf)) as Arc<dyn AsIoBufMut>;
+        let (tx, rx) = flume::bounded(1);
+        if let Err(SendError(event)) = self.operation_event_tx.send(OperationEvent::Recv {
+            handle: self.handle,
+            buffer: buf.clone(),
+            result_tx: tx,
+        }) {
+            match event {
+                OperationEvent::Recv { buffer, .. } => {
+                    // make sure buffer ref count is 1
+                    drop(buf);
 
-    /// Receive data with buffer from peer, will return actually receive size
-    pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut read_state = self.read_state.lock().await;
+                    // Safety: type is correct
+                    let buffer = unsafe { cast_dyn_io_buf_mut(buffer) };
 
-        poll_fn(|cx| {
-            loop {
-                match &*read_state {
-                    RecvState::Buffer(_) => {
-                        let (tx, rx) = crossbeam_channel::bounded(1);
-                        let read_state = mem::replace(&mut *read_state, RecvState::WaitResult(rx));
-                        let buf = match read_state {
-                            RecvState::Buffer(buf) => buf,
-                            _ => unreachable!(),
-                        };
-
-                        self.read_waker.register(cx.waker());
-                        if self
-                            .wake_event_tx
-                            .send(WakeEvent::Read(ReadWakeEvent {
-                                handle: TypedSocketHandle::Udp { handle: self.handle, src: self.local_addr, dst: self.remote_addr },
-                                buffer: buf,
-                                waker: create_share_waker(self.read_waker.clone()),
-                                respond: tx,
-                            }))
-                            .is_err()
-                        {
-                            error!("TcpStack may be dropped, send wake event failed");
-
-                            return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)));
-                        }
-
-                        return Poll::Pending;
-                    }
-
-                    RecvState::WaitResult(rx) => {
-                        self.read_waker.register(cx.waker());
-
-                        let read_poll = match rx.try_recv() {
-                            Err(TryRecvError::Empty) => return Poll::Pending,
-                            Err(TryRecvError::Disconnected) => {
-                                error!("TcpStack may be dropped, try receive wake event response failed");
-
-                                return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)));
-                            }
-                            Ok(read_poll) => read_poll,
-                        };
-
-                        match read_poll {
-                            ReadPoll::Pending(buf) => {
-                                *read_state = RecvState::Buffer(buf);
-
-                                // tcp stack wake but in earlier udp socket not ready, so we need to
-                                // poll again
-                                continue;
-                            }
-
-                            ReadPoll::Ready { buf: mut inner_buf, result } => {
-                                return match result {
-                                    Ok(_) => {
-                                        let n = inner_buf.len().min(buf.len());
-                                        inner_buf.copy_to_slice(&mut buf[..n]);
-                                        inner_buf.clear();
-
-                                        *read_state = RecvState::Buffer(inner_buf);
-
-                                        Poll::Ready(Ok(n))
-                                    }
-
-                                    Err(err) => {
-                                        *read_state = RecvState::Buffer(inner_buf);
-
-                                        Poll::Ready(Err(err))
-                                    }
-                                };
-                            }
-                        }
-                    }
+                    return (
+                        Err(io::Error::new(
+                            ErrorKind::BrokenPipe,
+                            "TcpStack or EventGenerator may be dropped, send read operation event failed",
+                        )),
+                        buffer,
+                    );
                 }
-            }
-        }).await
-    }
 
-    /// Send data to peer, will return sent size
-    pub async fn send(&self, data: &[u8]) -> io::Result<usize> {
-        if data.len() > self.send_payload_capacity {
-            return Err(io::Error::new(
-                ErrorKind::Other,
-                format!(
-                    "data size is larger than send payload capacity: {}",
-                    self.send_payload_capacity
-                ),
-            ));
+                _ => unreachable!(),
+            }
         }
 
-        let mut write_state = self.write_state.lock().await;
+        match rx.recv_async().await {
+            Err(_) => {
+                // Safety: type is correct, and when recv_async failed, means sender is dropped,
+                // there is only 2 reasons cause it: TcpStack owning the sender, but TcpStack
+                // is dropped, or EventGenerator owning the sender, but EventGenerator is dropped
+                let buf = unsafe { cast_dyn_io_buf_mut(buf) };
 
-        let mut copied = false;
-        poll_fn(|cx| {
-            loop {
-                match &*write_state {
-                    SendState::Buffer(_) => {
-                        let (tx, rx) = crossbeam_channel::bounded(1);
-                        let write_state = mem::replace(&mut *write_state, SendState::Sending(rx));
-                        let mut buf = match write_state {
-                            SendState::Buffer(buf) => buf,
-                            _ => unreachable!(),
-                        };
-
-                        // avoid unnecessary copy
-                        if !copied {
-                            buf.extend_from_slice(data);
-                            copied = true;
-                        }
-
-                        self.write_waker.register(cx.waker());
-
-                        if self.wake_event_tx.send(WakeEvent::Write(WriteWakeEvent {
-                            handle: TypedSocketHandle::Udp { handle: self.handle, src: self.local_addr, dst: self.remote_addr },
-                            data: buf,
-                            waker: create_share_waker(self.write_waker.clone()),
-                            respond: tx,
-                        })).is_err() {
-                            error!("TcpStack may be dropped, send wake event failed");
-
-                            return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)));
-                        }
-
-                        return Poll::Pending;
-                    }
-
-                    SendState::Sending(rx) => {
-                        self.write_waker.register(cx.waker());
-
-                        let write_poll = match rx.try_recv() {
-                            Err(TryRecvError::Empty) => return Poll::Pending,
-                            Err(TryRecvError::Disconnected) => {
-                                error!("TcpStack may be dropped, try receive wake event response failed");
-
-                                return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)));
-                            }
-                            Ok(write_poll) => write_poll,
-                        };
-
-                        match write_poll {
-                            WritePoll::Pending(buf) => {
-                                *write_state = SendState::Buffer(buf);
-
-                                // tcp stack wake but in earlier udp socket not ready, so we need
-                                // to poll again
-                                continue;
-                            }
-
-                            WritePoll::Ready { buf, result } => {
-                                *write_state = SendState::Buffer(buf);
-
-                                return Poll::Ready(result);
-                            }
-                        }
-                    }
-                }
+                (
+                    Err(io::Error::new(
+                        ErrorKind::BrokenPipe,
+                        "TcpStack or EventGenerator may be dropped, receive read operation response failed",
+                    )),
+                    buf,
+                )
             }
-        }).await?;
 
-        Ok(data.len())
+            Ok(res) => {
+                // Safety: type is correct
+                let buf = unsafe { cast_dyn_io_buf_mut(buf) };
+
+                (res, buf)
+            }
+        }
+    }
+
+    /// Sends data to specify `addr` on the [`UdpSocket`].
+    pub async fn send<T: IoBuf + Send + Sync>(
+        &self,
+        buf: T,
+        addr: SocketAddr,
+    ) -> (io::Result<usize>, T) {
+        let buf = Arc::new(SharedBuf::new(buf)) as Arc<dyn AsIoBuf>;
+        let (tx, rx) = flume::bounded(1);
+        if let Err(SendError(event)) = self.operation_event_tx.send(OperationEvent::Send {
+            handle: self.handle,
+            src: addr,
+            buffer: buf.clone(),
+            result_tx: tx,
+        }) {
+            match event {
+                OperationEvent::Send { buffer, .. } => {
+                    // make sure buffer ref count is 1
+                    drop(buf);
+
+                    // Safety: type is correct
+                    let buffer = unsafe { cast_dyn_io_buf(buffer) };
+
+                    return (
+                        Err(io::Error::new(
+                            ErrorKind::BrokenPipe,
+                            "TcpStack or EventGenerator may be dropped, send write operation event failed",
+                        )),
+                        buffer,
+                    );
+                }
+
+                _ => unreachable!(),
+            }
+        }
+
+        match rx.recv_async().await {
+            Err(_) => {
+                // Safety: type is correct, and when recv_async failed, means sender is dropped,
+                // there is only 2 reasons cause it: TcpStack owning the sender, but TcpStack
+                // is dropped, or EventGenerator owning the sender, but EventGenerator is dropped
+                let buf = unsafe { cast_dyn_io_buf(buf) };
+
+                (
+                    Err(io::Error::new(
+                        ErrorKind::BrokenPipe,
+                        "TcpStack or EventGenerator may be dropped, receive write operation response failed",
+                    )),
+                    buf,
+                )
+            }
+
+            Ok(res) => {
+                // Safety: type is correct
+                let buf = unsafe { cast_dyn_io_buf(buf) };
+
+                (res, buf)
+            }
+        }
     }
 }
 
 impl Drop for UdpSocket {
     fn drop(&mut self) {
-        let _ = self.wake_event_tx.send(WakeEvent::Close(CloseEvent {
-            handle: TypedSocketHandle::Udp {
-                handle: self.handle,
-                src: self.local_addr,
-                dst: self.remote_addr,
-            },
-        }));
+        let _ = self
+            .operation_event_tx
+            .send(OperationEvent::Close(TypedSocketHandle::Udp(self.handle)));
     }
 }
 
 /// a UDP socket acceptor, like [TcpAcceptor](super::tcp::TcpAcceptor), but you will accept a
-/// client side UDP socket, not server side
+/// client side UDP socket, not server side.
 #[derive(Derivative)]
 #[derivative(Debug)]
 pub struct UdpAcceptor {
     #[derivative(Debug = "ignore")]
     pub(crate) udp_stream_rx: RecvStream<'static, io::Result<UdpInfo>>,
-    pub(crate) wake_event_tx: NotifySender<WakeEvent>,
+    pub(crate) operation_event_tx: NotifySender<OperationEvent>,
 }
 
 impl Stream for UdpAcceptor {
@@ -270,19 +181,9 @@ impl Stream for UdpAcceptor {
         match res {
             None => Poll::Ready(None),
             Some(udp_info) => Poll::Ready(Some(Ok(UdpSocket {
-                local_addr: udp_info.local_addr,
                 remote_addr: udp_info.remote_addr,
                 handle: udp_info.handle,
-                send_payload_capacity: udp_info.send_payload_capacity,
-                wake_event_tx: self.wake_event_tx.clone(),
-                read_state: Mutex::new(RecvState::Buffer(BytesMut::with_capacity(
-                    udp_info.recv_payload_capacity,
-                ))),
-                write_state: Mutex::new(SendState::Buffer(BytesMut::with_capacity(
-                    udp_info.send_payload_capacity,
-                ))),
-                read_waker: Default::default(),
-                write_waker: Arc::new(Default::default()),
+                operation_event_tx: self.operation_event_tx.clone(),
             }))),
         }
     }

@@ -5,22 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Wake, Waker};
 
-pub fn wake_fn<F: Fn() + Send + Sync + 'static>(f: F) -> Waker {
-    Waker::from(Arc::new(WakeFn { f }))
-}
-
-#[derive(Debug)]
-struct WakeFn<F: Fn()> {
-    f: F,
-}
-
-impl<F: Fn()> Wake for WakeFn<F> {
-    fn wake(self: Arc<Self>) {
-        (self.f)();
-    }
-}
-
-pub fn wake_once_fn<F: FnOnce() + Send + Sync + 'static>(f: F) -> Waker {
+pub fn wake_once_fn<F: FnOnce() + Send + 'static>(f: F) -> Waker {
     Waker::from(Arc::new(WakeOnceFn {
         f: AtomicOption {
             used: Default::default(),
@@ -30,7 +15,7 @@ pub fn wake_once_fn<F: FnOnce() + Send + Sync + 'static>(f: F) -> Waker {
 }
 
 #[derive(Debug)]
-struct WakeOnceFn<F: FnOnce()> {
+struct WakeOnceFn<F> {
     f: AtomicOption<F>,
 }
 
@@ -70,7 +55,8 @@ impl<T> AtomicOption<T> {
     }
 }
 
-unsafe impl<T: Send> Sync for AtomicOption<T> {}
+// Safety: the AtomicBool guarantee only one can access the T
+unsafe impl<T> Sync for AtomicOption<T> {}
 
 impl<T> Drop for AtomicOption<T> {
     fn drop(&mut self) {

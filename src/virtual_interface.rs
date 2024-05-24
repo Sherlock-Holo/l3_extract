@@ -20,16 +20,12 @@ impl VirtualInterface {
         }
     }
 
-    pub fn push_receive_packet(&mut self, packet: &[u8]) {
-        self.rx_queue.push_back(BytesMut::from(packet));
+    pub fn push_receive_packet(&mut self, packet: BytesMut) {
+        self.rx_queue.push_back(packet);
     }
 
-    pub fn peek_send_packet(&mut self) -> Option<Bytes> {
-        self.tx_queue.front().cloned()
-    }
-
-    pub fn consume_send_packet(&mut self) {
-        self.tx_queue.pop_front().expect("tx queue is empty");
+    pub fn pop_all_send_packets(&mut self) -> impl IntoIterator<Item = Bytes> + '_ {
+        self.tx_queue.drain(..)
     }
 }
 
