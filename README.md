@@ -24,16 +24,6 @@ use futures_util::{AsyncRead, AsyncWrite, StreamExt, TryStreamExt};
 use futures_util::stream::FuturesUnordered;
 use futures_util::task::SpawnExt;
 use l3_extract::{EventGenerator, Ipv4Cidr, TcpStack};
-use futures_timer::Delay;
-
-#[derive(Default)]
-struct MyTimer;
-
-impl Timer for MyTimer {
-    async fn sleep(&mut self, dur: Duration) {
-        Delay::new(dur).await
-    }
-}
 
 async fn run() {
     let connection = create_layer3_connection();
